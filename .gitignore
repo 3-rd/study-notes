@@ -1,0 +1,6 @@
+# Jupyter Notebook 产物（由 build.py 生成）
+*.ipynb
+
+# Python
+__pycache__/
+*.py[cod]
