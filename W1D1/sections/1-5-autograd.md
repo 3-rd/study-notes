@@ -34,6 +34,34 @@ d = c.sum()
 print(d.grad_fn)  # <AddBackward1> — 两个图各自独立
 ```
 
+### 动态图 vs 静态图
+
+| | PyTorch（动态图） | TensorFlow 1.x（静态图） |
+|--|---|---|
+| 建图时机 | 前向传播时同步构建 | 先定义图，后执行 |
+| 控制流 | 直接用 Python `if/for/while` | 需要 `tf.cond`/`tf.while_loop` |
+| 调试 | 直接报错，可 print | 需要 `sess.run` 才能看值 |
+| 灵活性 | 极高，代码怎么写图就怎么建 | 需预先定义所有分支 |
+
+**动态图优势**：代码即模型，不用预先声明图结构。
+
+**静态图优势**：图结构已知，可做全局优化（如算子融合、内存规划），性能更好。TensorFlow 2.x 默认 eager execution（动态图），但用 `tf.function` 可以 jit 编译成静态图加速。PyTorch 的 `torch.compile` 也是类似思路——先把动态图"冻结"成静态图再优化。
+
+```python
+# 动态图：每行代码立即执行
+x = torch.tensor([1., 2.])
+y = x * 2        # 立即计算
+z = y + 1        # 立即计算
+
+# 静态图（TensorFlow 风格）：
+# x = tf.placeholder(tf.float32)   # 先声明
+# y = x * 2                        # 只是画边，不计算
+# with tf.Session() as sess:
+#     result = sess.run(y, feed_dict={x: [1., 2.]})  # 实际执行
+```
+
+**Notebook 中的内存问题**：动态图下，每次 cell 跑前向都会创建新的计算图节点，如果不断保存中间结果（图节点被引用），内存会累积。定期 `del` 不需要的变量 + `gc.collect()` 可缓解。静态图因为图结构固定，不存在这个问题。
+
 ---
 
 ## 1-5-2 backward() 与梯度计算
@@ -219,9 +247,38 @@ for data, target in dataloader:
     optimizer.step()         # Step 4: 更新参数
 ```
 
-**为什么不清零会累加？**
-- `backward()` 只会**累加**梯度到 `.grad`，不会覆盖
-- 这是为了支持**梯度累积**（gradient accumulation）—— 用小 batch 模拟大 batch
+**为什么设计成累加而不是覆盖？**
+
+这是**有意为之**，而不是"忘了清零"。累加设计是为了支持两种场景：
+
+**场景1：梯度累积（大 batch 训练）**
+```python
+# batch_size=64 显存不够，用4个 batch_size=16 累积
+for i, (data, target) in enumerate(dataloader):
+    output = model(data)
+    loss = criterion(output, target) / 4  # 归一化
+    loss.backward()   # 累加到 .grad
+    
+    if (i + 1) % 4 == 0:
+        optimizer.step()      # 用累积的梯度更新
+        optimizer.zero_grad()  # 4个batch累积完，清零
+```
+
+**场景2：多 loss 多路径回传**
+```python
+# 一个 shared 参数被多个分支使用
+shared_params = ...
+out1 = branch1(shared_params)
+out2 = branch2(shared_params)
+
+loss1 = criterion(out1, target1)
+loss2 = criterion(out2, target2)
+
+loss1.backward()  # shared_params.grad 有了第一份梯度
+loss2.backward()  # 累加第二份，两个分支的梯度都被保留
+```
+
+**如果设计成"清零覆盖"**：上述两个场景都直接坏掉——要么无法做梯度累积，要么多路径的梯度互相覆盖。累加设计把控制权交给用户，框架不隐式做主。
 
 ```python
 # 梯度累积：模拟 batch_size=64，实际用两个 batch_size=32
@@ -333,25 +390,49 @@ print("y.requires_grad:", y.requires_grad)  # True
 z_new = z * 2             # 无梯度追踪
 ```
 
-**典型用途**：需要对一个张量的值进行原地操作，又不想破坏原始计算图。
+### 共享存储的陷阱
+
+**detach() 出来的张量和原张量共享同一块底层内存**，修改其中一个会影响另一个：
 
 ```python
-# 错误示范：直接修改需要梯度的张量
 x = torch.tensor([1., 2., 3.], requires_grad=True)
-y = x * 2
+y = x * 2      # y = [2, 4, 6]
+z = y.detach() # z 和 y 共享底层存储
+
+z[0] = 99      # 原地修改 z
+print(y)        # y = [99, 4, 6]  ← y 也被改了！
+print(z)        # z = [99, 4, 6]
+```
+
+**安全用法**：detach 后立即做只读操作（打印、存列表、画图），不会出问题。
+
+**如果需要修改后不影响原值**，用 `clone()` 深拷贝：
+
+```python
+z = y.detach().clone()  # 深拷贝，不共享存储
+z[0] = 99
+print(y)  # y 不受影响
+```
+
+### 典型用途
+
+1. **需要原地修改张量值时**（叶子节点不能直接 in-place 修改）
+2. **把张量传给不需要梯度的函数**（如 numpy 操作、打印、画图）
+3. **阻止梯度回传到某条分支**（如 Actor-Critic 中 detach baseline）
+
+```python
+# 错误示范：直接修改需要梯度的叶子节点
+x = torch.tensor([1., 2., 3.], requires_grad=True)
 x[0] = 10                   # RuntimeError: a view of a variable
 
-# 正确做法：先 detach，再修改
-x = torch.tensor([1., 2., 3.], requires_grad=True)
-y = x * 2
+# 正确做法
 x_detached = x.detach()
 x_detached[0] = 10          # OK
-print(x_detached)           # tensor([10., 2., 3.])
 ```
 
 **detach() vs no_grad()**：
 - `no_grad()`：**整个代码块**都不追踪梯度
-- `detach()`：**单个张量**从图中分离出来
+- `detach()`：**单个张量**从图中分离出来（但共享存储）
 
 ---
 
@@ -359,26 +440,42 @@ print(x_detached)           # tensor([10., 2., 3.])
 
 **作用**：在不需要修改前向/反向代码的情况下，**拦截**前向传播或反向传播的过程，查看或修改中间张量/梯度。
 
-### 注册前向 hook
+**注册层级说明**：hook 绑定的位置决定触发次数：
+
+| 注册位置 | 触发次数 | 说明 |
+|---------|---------|------|
+| `model`（根模块） | 1次 | 拦截整个模型的最终输入输出 |
+| `model.fc1`（子模块） | 1次 | 只在 fc1 算完时触发 |
+| `model.fc2`（子模块） | 1次 | 只在 fc2 算完时触发 |
 
 ```python
 import torch
 import torch.nn as nn
 
-model = nn.Linear(10, 5)
+model = nn.Sequential(
+    nn.Linear(10, 5),
+    nn.Linear(5, 2)
+)
 
-def forward_hook(module, input, output):
-    print(f"输入形状: {input[0].shape}")
-    print(f"输出形状: {output.shape}")
-    return output  # 可以修改返回值
+# 注册在根模块：只触发1次（最终输出）
+handle = model.register_forward_hook(
+    lambda m, inp, out: print(f'根模块 hook，output shape: {out.shape}')
+)
 
-# 注册：返回 handle，用于取消注册
-handle = model.register_forward_hook(forward_hook)
+# 如果想拦截每个层，需要遍历注册
+for name, module in model.named_children():
+    module.register_forward_hook(
+        lambda m, inp, out: print(f'  层 {name} hook')
+    )
 
 x = torch.randn(2, 10)
 y = model(x)
+# 输出：
+#   层 0 hook
+#   层 1 hook
+#   根模块 hook
 
-handle.remove()   # 取消注册
+handle.remove()
 ```
 
 ### 注册反向 hook
@@ -430,45 +527,169 @@ model.layer2.register_forward_hook(hook_fn("layer2"))
 - **梯度消失**：|∂L/∂W| < 1，连乘后趋近于 0 → 参数几乎不更新
 - **梯度爆炸**：|∂L/∂W| > 1，连乘后趋近于 ∞ → 参数大幅震荡
 
-```python
-# 演示梯度消失
-import torch
+### 核心机制详解
 
-x = torch.tensor([0.5], requires_grad=True)
-for _ in range(20):
-    y = torch.nn.functional.sigmoid(x)
-    y = y * 0.01   # 缩小输出
-    y.backward()
-    print(f"x.grad = {x.grad.item():.6f}")
-    x.grad.zero_()
-    x = y.detach().requires_grad_(True)
-```
-
-### 解决方案
-
-| 方法 | 代码 |
-|---|---|
-| 梯度裁剪 | `torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)` |
-| 残差连接 | `output = x + self.layer(x)` — 梯度直接回传 |
-| 归一化 | BatchNorm / LayerNorm — 稳定梯度分布 |
-| 激活函数 | ReLU 替代 Sigmoid/Tanh（梯度更稳定） |
-| 权重初始化 | `nn.init.kaiming_normal_` / `xavier_uniform_` |
-| LSTM/GRU | 门控机制缓解长期依赖的梯度问题 |
+#### 梯度裁剪（直接修改梯度）
 
 ```python
-# 训练循环中加入梯度裁剪
-for epoch in range(E):
-    for batch in loader:
-        optimizer.zero_grad()
-        output = model(batch)
-        loss = criterion(output, target)
-        loss.backward()
-        
-        # 裁剪：所有参数梯度的 L2 范数不超过 1.0
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 ```
+
+**原理**：计算所有参数梯度的 L2 范数 `||g||₂ = √(g₁² + g₂² + ...)`，如果超过 `max_norm`，等比例缩放回来。
+
+```python
+# 等价逻辑
+total_norm = 0.0
+for p in model.parameters():
+    total_norm += p.grad.norm(2).item() ** 2
+total_norm = total_norm ** 0.5
+
+if total_norm > max_norm:
+    clip_coef = max_norm / total_norm
+    for p in model.parameters():
+        p.grad.mul_(clip_coef)  # 直接缩放梯度
+```
+
+**特点**：这是**唯一一个直接在反向传播后修改梯度**的方法，属于"事后补救"。只能防止爆炸，不能防止消失。
+
+#### 残差连接（加法保梯度）
+
+```
+普通层：output = H(x)
+残差层：output = H(x) + x
+```
+
+**关键**：加法的反向传播是"分流"的——`∂(H+x)/∂x = ∂H/∂x + 1`。
+
+无论 H(x) 的梯度多小，加个 `+1` 就让梯度永远不会消失。也不存在梯度爆炸的问题（加法不会让梯度相乘变大）。
+
+#### 归一化（稳定激活值，间接稳定梯度）
+
+BatchNorm 前向：
+```python
+mu = x.mean(dim=0)
+var = x.var(dim=0)
+x_norm = (x - mu) / sqrt(var + eps)
+y = gamma * x_norm + beta
+```
+
+**对梯度的影响**：
+- **间接**：把激活值压到稳定范围（前向数值稳定 → 反向梯度数值也稳定）
+- **直接**：gamma/beta 作为可学习参数，提供稳定的梯度回传路径（形状固定为特征维度，不会随深度指数变化）
+
+#### 激活函数（间接影响梯度）
+
+激活函数在前向时改变激活值分布，间接影响梯度：
+
+| 激活函数 | 前向特点 | 对梯度的影响 |
+|---------|---------|-------------|
+| Sigmoid | 输出 0~1 | 导数最大 0.25，深层连乘≈0，梯度消失 |
+| Tanh | 输出 -1~1 | 导数最大 1，比 Sigmoid 好，但仍有消失问题 |
+| ReLU | 负区=0，正区=原值 | 正区导数恒为 1，不消失 |
+
+**ReLU 的梯度（工程定义）**：
+```
+x > 0: 梯度 = 1
+x < 0: 梯度 = 0（截断）
+x = 0: 梯度 = 0 或 1（工程规定，不是数学严格定义）
+```
+
+**注意**：ReLU 在 x=0 处数学上不可导，但工程上通过**规定 subgradient**（次梯度）让它能参与反向传播。
+
+#### 权重初始化（预防）
+
+权重太小 → 激活值逐层变小 → 梯度消失
+权重太大 → 激活值逐层变大 → 梯度爆炸
+
+合理的初始化（如 Kaiming/Xavier）让各层激活值和梯度的方差在合理范围，从源头降低消失/爆炸风险。
+
+#### LSTM/GRU（门控机制）
+
+RNN 循环使用同一个权重矩阵 W：`h_t = h_{t-1} @ W`
+
+梯度回传时：`∂h_T/∂h_t = W^T @ W^T @ ... @ W^T`（T-t 次连乘）
+
+LSTM/GRU 通过**门控**决定保留多少历史、多少新信息：
+```
+h_t = h_{t-1} * output_gate + new_gate * input_gate
+```
+梯度可以"抄近道"不经过所有 W 连乘，从根本上缓解消失/爆炸。
+
+### 方法分类总结
+
+| 方法 | 操作阶段 | 机制 |
+|------|---------|------|
+| 梯度裁剪 | **反向传播后** | 直接修改梯度，治标 |
+| 残差连接 | 前向 | 加法+1保梯度，治本 |
+| 归一化 | 前向 | 稳定激活值→稳定梯度，治本 |
+| 激活函数 | 前向 | 改变激活值分布，间接影响 |
+| 权重初始化 | 前向（训练前） | 预防，治本 |
+| LSTM/GRU | 前向 | 门控减少连乘，治本 |
+
+**大多数方法都是在"前向阶段预防"梯度问题，只有梯度裁剪是在"反向传播后直接修改梯度"。**
+
+---
+
+## 1-5-7.5 nn.Module 与 nn.Parameter
+
+### 为什么需要 nn.Module？
+
+纯 tensor 的问题：参数需要手动管理。
+
+```python
+# 纯 tensor 写法
+W = torch.randn(10, 5, requires_grad=True)
+b = torch.randn(5, requires_grad=True)
+optimizer = torch.optim.SGD([W, b], lr=0.1)  # 手动传入参数列表
+```
+
+**nn.Module 的核心价值**：
+
+1. **自动参数收集**：`model.parameters()` 把所有带梯度的参数收拢在一起
+2. **设备统一管理**：`model.to('cuda')` 一次移动所有参数
+3. **封装复用**：把参数和计算逻辑打包成独立模块
+
+```python
+# nn.Module 写法
+class Linear(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(in_features, out_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+    
+    def forward(self, x):
+        return x @ self.weight + self.bias
+
+model = Linear(10, 5)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)  # 自动收集所有参数
+```
+
+### nn.Parameter 是什么？
+
+```python
+nn.Parameter(tensor) ≈ torch.tensor(..., requires_grad=True) + 自动注册到父 Module
+```
+
+| | 普通 tensor | nn.Parameter |
+|--|-----------|--------------|
+| `requires_grad` | 默认 False | 默认 True |
+| 被 `model.parameters()` 收集 | ❌ | ✅ |
+| 能被 optimizer 更新 | ❌ | ✅ |
+
+`nn.Parameter` 就是 `requires_grad=True` 的 tensor，外层包了一层"注册"逻辑。本质上还是个 tensor。
+
+### 计算图视角下的 nn.Module
+
+```
+nn.Module
+    ├── self.weight (nn.Parameter = requires_grad=True 的 tensor)
+    ├── self.bias   (nn.Parameter = requires_grad=True 的 tensor)
+    └── forward()
+            ↓
+        构建计算图（和纯 tensor 完全一样）
+```
+
+`nn.Module` 本身不参与计算图，它只是 Python 层的组织结构。真正参与计算图的是 `nn.Parameter`——它们本质上是 tensor。`model(x)` 执行时，实际上是在 tensor 层面做运算，构建计算图。**nn.Module 是组织的壳，nn.Parameter 才是参与梯度追踪的实际的 tensor。**
 
 ---
 
