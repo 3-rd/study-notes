@@ -194,6 +194,38 @@ trainable = [p for p in model.parameters() if p.requires_grad]
 print("可训练参数:", sum(p.numel() for p in trainable))
 ```
 
+### 冻结参数在梯度链中的行为
+
+**冻结参数（`requires_grad=False`）不等于截断梯度**。冻结参数的梯度原封不动继续往上传，冻结只是"不记录该参数的梯度"。
+
+```python
+import torch
+
+x = torch.tensor([1., 2.], requires_grad=True)
+w_frozen = torch.tensor([[1., 0.], [0., 1.]], requires_grad=False)  # 冻结
+w_trainable = torch.tensor([[2., 0.], [0., 2.]], requires_grad=True)  # 可训练
+
+y = x @ w_frozen @ w_trainable
+loss = y.sum()
+loss.backward()
+
+print("x.grad:", x.grad)              # 有梯度（w_frozen 没阻断）
+print("w_trainable.grad:", w_trainable.grad)  # 有梯度
+```
+
+梯度路径：`loss → w_trainable → w_frozen → x`
+
+w_frozen 被跳过（不记录梯度），但梯度继续传给它上游的 x。
+
+**冻结 vs detach 的本质区别**：
+
+| 操作 | 梯度流过？ | 记录该参数梯度？ |
+|------|-----------|----------------|
+| `requires_grad=False` | ✅ 畅通，梯度原封不动 | ❌ 不记录 |
+| `detach()` | ❌ **截断**，梯度停止 | — |
+
+**冻结参数的典型应用**：预训练模型 backbone 冻住，只 fine-tune 头部。backbone 的权重作为已知的"常量"，只更新 head 的参数——backbone 本身不更新，但梯度仍然流过它。
+
 ---
 
 ## 3-3 state_dict 与模型保存加载
@@ -679,7 +711,7 @@ class CNN(nn.Module):
 - `eval()`：BatchNorm 用全局 moving average，Dropout 全部通过
 - 两者都只影响特定层的统计行为，不影响其他层
 
-**Q4: 如何冻结部分层？**
+**Q4: 如何冻结部分层？冻结后梯度怎么传？**
 ```python
 for param in model.layer1.parameters():
     param.requires_grad = False
@@ -688,6 +720,9 @@ optimizer = torch.optim.SGD(
     lr=0.01
 )
 ```
+- 冻结（`requires_grad=False`）：梯度**原封不动**往上继续传，只是该参数本身不记录梯度
+- 对比 `detach()`：真正截断梯度流，梯度停止传播
+- 冻结不等同于"置零"或"常数"，它仍然参与计算图，只是可学习性被关闭
 
 **Q5: `state_dict()` 保存的是什么？**
 - 所有 `nn.Parameter` 的字典，key 是参数名（如 `layer1.weight`），value 是张量
