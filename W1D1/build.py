@@ -49,7 +49,7 @@ SECTIONS = [
          ('1-7-defaults','1.7 默认值总结'),
      ]),
     ('二、自动求导（Autograd）— PyTorch 灵魂', 'sections/1-5-autograd.md', []),
-    ('三、nn.Module — 模型构建核心', None, []),
+    ('三、nn.Module — 模型构建核心', 'sections/3-nn-module.md', []),
     ('四、torch.optim — 优化器', None, []),
     ('五、DataLoader — 数据加载', None, []),
     ('六、模型保存与加载', None, []),
@@ -156,44 +156,16 @@ NN_MD = new_markdown_cell("""## 三、`nn.Module` — 模型构建核心
 """)
 
 cells.append(NN_MD)
-cells.append(new_markdown_cell('### 练习：nn.Module 实战'))
-cells.append(new_code_cell("""import torch
-import torch.nn as nn
-
-class SimpleNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc1 = nn.Linear(10, 5)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(5, 2)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
-        return x
-
-model = SimpleNet()
-print("参数数量:", sum(p.numel() for p in model.parameters()))
-for name, p in model.named_parameters():
-    print(f"  {name}: {p.shape}")
-x = torch.randn(1, 10)
-out = model(x)
-print("输出:", out.shape)"""))
-
-cells.append(new_markdown_cell('### 练习：train / eval 模式差异'))
-cells.append(new_code_cell("""import torch
-import torch.nn as nn
-
-dropout = nn.Dropout(p=0.5)
-x = torch.ones(5)
-print("train 模式:", dropout(x))
-print("eval 模式:", dropout.eval())
-
-bn = nn.BatchNorm1d(3)
-x = torch.randn(4, 3)
-print("train 模式 mean:", bn(x).mean(dim=0))
-print("eval 模式 mean:", bn.eval()(x).mean(dim=0))"""))
+# 从 sections/3-nn-module.md 读取完整内容
+_nn_path = os.path.join(DIR, 'sections', '3-nn-module.md')
+if os.path.exists(_nn_path):
+    _text = open(_nn_path, encoding='utf-8').read()
+    _parsed = split_cells(_text)
+    for _kind, _content in _parsed:
+        if _kind == 'md' and _content.strip():
+            cells.append(new_markdown_cell(_content))
+        elif _kind == 'code' and _content.strip():
+            cells.append(new_code_cell(_content))
 
 OPTIM_MD = new_markdown_cell("""## 四、`torch.optim` — 优化器
 
