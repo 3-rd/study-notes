@@ -854,146 +854,315 @@ x = torch.randn(1, 3, 224, 224)
 
 ---
 
-### 经典 CNN 网络结构（PyTorch 视角）
+### 池化层详解：MaxPool / AvgPool / AdaptiveAvgPool
 
-以下所有模型均可通过 `torchvision.models` 直接加载。
-
-#### LeNet-5（1998）— 开创者
-
-```
-Input(1×32×32)
-→ Conv(6, 5×5, s=1) → AvgPool(2×2)
-→ Conv(16, 5×5, s=1) → AvgPool(2×2)
-→ FC(120) → FC(84) → FC(10)
-```
-**特点**：2 conv + 3 fc，激活用 Sigmoid，汇聚用 AvgPool。
-
-#### AlexNet（2012）— 深度学习复兴
-
-```
-Input(3×224×224)
-→ Conv(96, 11×11, s=4) → MaxPool(3×3)
-→ Conv(256, 5×5, padding=2) → MaxPool(3×3)
-→ Conv(384, 3×3, p=1) × 3
-→ FC(4096) → FC(4096) → FC(1000)
-```
-**贡献**：ReLU 激活、Dropout、GPU 并行训练、Data Augmentation。
-
-#### VGG-16/19（2014）— 简洁即美
-
-```
-VGG-16:
-Input
-→ Conv(64)×2          → MaxPool
-→ Conv(128)×2         → MaxPool
-→ Conv(256)×3         → MaxPool
-→ Conv(512)×3         → MaxPool
-→ Conv(512)×3         → MaxPool
-→ FC(4096) → FC(4096) → FC(1000)
-```
-**贡献**：全部用 3×3 小滤波器 + 2×2 MaxPool，堆叠深；证明了深度是提升性能的关键。
-
-**为什么小滤波器堆叠 > 大滤波器**：
-- 2 个 3×3 的感受野 = 5×5，且参数量更少（2×9 vs 25）
-- 3 个 3×3 的感受野 = 7×7，参数量更少且多了非线性层
-
-#### GoogLeNet / Inception（2014）— 多尺度并行
-
-**核心模块 Inception**：
-```
-         → Conv(1×1) → Conv(3×3) ─┐
-input → Conv(1×1) ─┬→ Conv(5×5) ─┤→ concat
-         → Conv(1×1) → MaxPool(3×3) ─┘
-```
-同时用 1×1、3×3、5×5 卷积 + pooling，多尺度并行提取特征，最后 concat。
-
-**1×1 卷积的作用**：降维（减少参数量）+ 跨通道信息整合。
-
-#### ResNet（2015）— 残差革命
-
-**核心：残差连接**
-```python
-# 普通卷积块
-def plain_block(x):
-    return conv_layers(x)
-
-# 残差块
-def residual_block(x):
-    out = conv_layers(x)
-    return out + x  # 跳跃连接 ← 关键！
-```
-
-数学上：y = F(x) + x，对 F 求导时路径上有恒等梯度 1 → **从根本上解决梯度消失**。
-
-```
-ResNet-50:
-Input
-→ Conv(64, 7×7, s=2) → MaxPool
-→ Conv(64, 1×1) → Conv(64, 3×3) → Conv(256, 1×1)  × 3    (stage2)
-→ Conv(128, 1×1) → Conv(128, 3×3) → Conv(512, 1×1)  × 4    (stage3)
-→ Conv(256, 1×1) → Conv(256, 3×3) → Conv(1024, 1×1) × 6    (stage4)
-→ Conv(512, 1×1) → Conv(512, 3×3) → Conv(2048, 1×1) × 3    (stage5)
-→ GlobalAvgPool → FC(1000)
-```
-
-#### MobileNet V1/V2/V3（2017-2019）— 移动端优先
-
-**MobileNet V1：Depthwise Separable Convolution**
-```python
-# 普通卷积: groups=1, 所有通道一起算
-# Depthwise: groups=in_channels, 每个通道独立算
-# Pointwise: 1×1 卷积，跨通道混合
-
-x → DepthwiseConv(k×k) → PointwiseConv(1×1) → ReLU6
-```
-
-参数量对比：普通 Conv(K×K×Cin×Cout) vs Depthwise(K×K×Cin) + Pointwise(1×1×Cin×Cout)
-→ 约减少 K² 倍参数。
-
-**MobileNet V2：Inverted Residual + Linear Bottleneck**
-```
-输入 → 1×1 升维 → 3×3 Depthwise → 1×1 降维 → output
-                ↑                       ↓
-              shortcut (只在扩展后维度相同时才有)
-```
-
-**MobileNet V3**：用了 NAS（神经网络搜索）找最优结构 + SE（Squeeze-and-Excitation）注意力。
-
-#### 经典网络对比总结
-
-| 网络 | 年份 | 参数量 | 创新点 | 适用场景 |
-|------|------|--------|--------|---------|
-| LeNet-5 | 1998 | ~60K | 开创 CNN | MNIST |
-| AlexNet | 2012 | ~60M | ReLU + Dropout + GPU | 图像分类基准 |
-| VGG-16 | 2014 | ~138M | 全 3×3 小滤波器堆叠 | 预训练 backbone |
-| GoogLeNet | 2014 | ~5M | Inception 多尺度 | 移动端 |
-| ResNet-50 | 2015 | ~25.5M | 残差连接 | **最通用 backbone** |
-| MobileNetV3 | 2019 | ~5.4M | NAS + SE 注意力 | 移动端/边缘 |
-
-**实际工程选择**：
-- 通用 backbone → **ResNet-50**（精度/参数量均衡）
-- 移动端/边缘 → **MobileNetV3**
-- 需要丰富多尺度特征 → **FPN / RetinaNet** 等目标检测专用 backbone
-
-#### PyTorch 加载示例
+#### nn.MaxPool2d — 最大池化
 
 ```python
-import torchvision.models as models
+import torch.nn as nn
 
-# 方式一：预训练权重（推荐）
-resnet = models.resnet50(weights='IMAGENET1K_V1')
-alexnet = models.alexnet(weights='IMAGENET1K_V1')
-vgg16 = models.vgg16(weights='IMAGENET1K_V1')
-mobilenet = models.mobilenet_v3_small(weights='IMAGENET1K_V1')
+# kernel_size: 池化核大小
+# stride: 步长（默认等于 kernel_size）
+# padding: 边缘填充
+# dilation: 核内空洞间距（膨胀系数）
+# ceil_mode: True=向上取整，False=向下取整（默认）
 
-# 方式二：去掉分类头，做特征提取
-resnet = models.resnet50(weights='IMAGENET1K_V1')
-resnet = nn.Sequential(*list(resnet.children())[:-1])  # 去掉 FC 层
-features = resnet(torch.randn(1, 3, 224, 224))  # (1, 2048, 1, 1)
-
-# 方式三：迁移学习（换头）
-resnet.fc = nn.Linear(2048, 10)  # 换成自己的 10 类分类头
+pool = nn.MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1)
+x = torch.randn(1, 3, 32, 32)
+y = pool(x)  # (1, 3, 16, 16)
 ```
+
+**前向过程**：在每个 kernel 窗口内取最大值，同时记录最大值位置（indices）。
+
+**反向过程（关键）**：MaxPool 的反向传播**只沿最大值位置传递梯度**，其他位置梯度为 0。这叫 **Max Pooling 的梯度路由**。
+
+```python
+# 验证 MaxPool 反向传播
+import torch
+
+pool = nn.MaxPool2d(2, stride=2)
+x = torch.tensor([[[[1., 2.], [3., 4.]]]], requires_grad=True)
+y = pool(x)
+loss = y.sum()
+loss.backward()
+
+print("x.grad:")  # 只有最大值位置(=4)的梯度为1，其他为0
+print(x.grad)     # [[[[0., 0.], [0., 1.]]]]
+```
+
+**dilation（膨胀/空洞）参数**：
+```python
+pool_dilated = nn.MaxPool2d(kernel_size=3, dilation=2)
+# 等效感受野 = kernel_size + (kernel_size-1)*(dilation-1) = 3 + 2*1 = 5
+# 但实际 kernel 还是 3×3，参数不变，只是采样时跳过了空洞
+```
+
+#### nn.AvgPool2d — 平均池化
+
+```python
+avg = nn.AvgPool2d(kernel_size=2, stride=2)
+# 前向：取 kernel 内均值
+# 反向：梯度平均分配给 kernel 内所有位置（= 1/(k*k)）
+```
+
+#### Global Average Pooling (GAP)
+
+```python
+gap = nn.AdaptiveAvgPool2d(output_size=(1, 1))
+x = torch.randn(4, 512, 7, 7)
+y = gap(x)  # (4, 512, 1, 1) → squeeze → (4, 512)
+```
+
+GAP 将每个通道压缩为 1 个值，完全替代 FC 层。优点：**无参数，不易过拟合**，Inception/ResNet 等现代网络最后常用 GAP。
+
+#### AdaptiveAvgPool2d — 自适应输出尺寸
+
+```python
+# 自适应输出到指定尺寸，框架自动计算 kernel_size 和 stride
+adaptive = nn.AdaptiveAvgPool2d(output_size=(3, 3))  # 输出 3×3
+adaptive = nn.AdaptiveAvgPool2d(output_size=(1, 1))   # 输出 1×1（GAP）
+```
+
+无论输入是 7×7 还是 14×14，自适应池化都能输出 3×3，**不需要关心输入尺寸**。
+
+---
+
+### nn.BatchNorm2d — 批归一化深入
+
+#### 训练 vs 推理的统计量差异
+
+```python
+bn = nn.BatchNorm2d(num_features=64)
+
+bn.train()   # 训练模式
+bn.eval()    # 推理模式
+```
+
+| 模式 | 均值/方差来源 | `running_mean/var` |
+|------|------------|-------------------|
+| train | 当前 batch 实时计算 | **会更新**（指数移动平均） |
+| eval | 不计算，用全局统计量 | **不变**，训练时累积的值 |
+
+**running_mean/var 的更新公式**：
+```
+running_mean = (1 - momentum) * running_mean + momentum * batch_mean
+running_var  = (1 - momentum) * running_var  + momentum * batch_var
+```
+
+momentum 默认 0.1（PyTorch 中 `momentum=0.1`），意义：**快速追踪近期 batch 统计量变化**。
+
+#### track_running_stats 参数
+
+```python
+bn = nn.BatchNorm2d(64, track_running_stats=False)
+# 推理时也用 batch 统计量（用于测试集和训练集分布差异大的场景）
+```
+
+#### 推理时 BN 的确定性行为
+
+eval 模式下，`BatchNorm` 的行为是**完全确定性**的：
+
+```python
+bn.eval()
+y1 = bn(x1)  # 无论 x1 是什么，running_mean/var 都固定
+y2 = bn(x2)  # y1 和 y2 不可能相等，因为 x 不同 → 但 running_stats 确实不变
+```
+
+**关键误解澄清**：eval 模式不是"用 running_mean 代替 batch_mean"，而是：
+- **训练阶段**：归一化用 batch 统计量（实时计算）
+- **推理阶段**：归一化用 running 统计量（EMA 累积）
+
+两者公式完全一样，只是"均值/方差从哪来"不同。
+
+#### BatchNorm 在什么时候更新 running statistics
+
+```python
+bn.train()
+bn.eval()  # ← 切换到 eval 后，running_mean/var **完全停止更新**
+
+bn.eval()
+bn.train()  # ← 切换回 train 后，继续用 batch 统计量更新 running_mean/var
+```
+
+---
+
+### nn.Dropout — 随机失活深入
+
+#### 训练模式的 mask 生成机制
+
+```python
+dropout = nn.Dropout(p=0.5)  # p=丢弃概率
+
+x = torch.tensor([1., 2., 3., 4., 5.])
+y_train = dropout(x)
+# 前向：随机生成 0/1 mask，以 p 概率置 0，剩余 / (1-p)
+# 反向：mask=0 的位置梯度=0（不更新），mask=1 的位置正常回传
+```
+
+**mask 生成过程（PyTorch 内部）**：
+```python
+# 伪代码
+mask = (torch.rand(x.shape) > p) / (1 - p)  # 注意除以 (1-p)
+y = x * mask
+```
+
+#### 反向传播：mask 本身不参与梯度计算
+
+Dropout 反向传播的梯度 = 上游梯度 × mask，关键：**mask 在反向时是固定的**（和前向用同一个 mask），mask 本身不产生梯度。
+
+```python
+# 验证：Dropout 反向传播
+x = torch.tensor([1., 2., 3.], requires_grad=True)
+dropout = nn.Dropout(p=0.5)
+y = dropout(x)
+loss = y.sum()
+loss.backward()
+
+# x.grad: 某些位置梯度为 0（被 mask 丢弃），某些位置正常
+# x.grad != 0 的位置和前向 mask=1 的位置完全一致
+```
+
+#### Inverted Dropout（PyTorch 使用的方式）
+
+训练时做缩放（除以 1-p），推理时不做任何操作：
+```python
+# Inverted Dropout（PyTorch / TF / 大多数框架）
+y = x * mask / (1-p)  # 训练时
+
+# 推理时：所有神经元参与，输出期望 E[y] = x
+```
+
+优势：**推理代码和训练代码完全一致**，只需切换 mode。相对于"推理时手动缩放"更简洁。
+
+---
+
+### nn.ConvTranspose2d — 转置卷积（反卷积）
+
+转置卷积不是卷积的逆运算，而是**卷积的梯度运算**（conv transpose = gradient with respect to input）。
+
+```python
+conv = nn.ConvTranspose2d(in_channels=64, out_channels=32, kernel_size=3, stride=2, padding=1, output_padding=1)
+# stride=2: 输出尺寸 = 输入尺寸 × 2（upsample）
+# output_padding=1: 消除 stride>1 时的一个单元偏移
+```
+
+**用途**：上采样（GAN、U-Net、语义分割）、生成器网络。
+
+**输出尺寸公式**：
+```
+H_out = (H_in - 1) * stride - 2*padding + dilation*(kernel_size-1) + output_padding + 1
+```
+
+```python
+# 示例
+deconv = nn.ConvTranspose2d(1, 1, kernel_size=3, stride=2, padding=1, output_padding=1)
+x = torch.randn(1, 1, 4, 4)
+y = deconv(x)  # (1, 1, 8, 8) — 4×2=8
+```
+
+---
+
+### nn.LSTM — 长短期记忆网络深入
+
+#### LSTM 的四个门控机制
+
+```python
+import torch.nn as nn
+
+lstm = nn.LSTM(input_size=10, hidden_size=32, num_layers=2, batch_first=True, bidirectional=False)
+
+x = torch.randn(4, 8, 10)  # (batch, seq_len, input_size)
+output, (hn, cn) = lstm(x)
+```
+
+LSTM 内部有 4 个门控，计算公式：
+
+```
+f_t = σ(W_f · [h_{t-1}, x_t] + b_f)     # 遗忘门：决定丢弃多少旧信息
+i_t = σ(W_i · [h_{t-1}, x_t] + b_i)     # 输入门：决定写入多少新信息
+C'_t = tanh(W_C · [h_{t-1}, x_t] + b_C) # 候选记忆：新的候选值
+C_t = f_t * C_{t-1} + i_t * C'_t         # 细胞状态：遗忘+输入的组合
+
+o_t = σ(W_o · [h_{t-1}, x_t] + b_o)     # 输出门：决定输出多少
+h_t = o_t * tanh(C_t)                    # 隐藏状态：输出门 × tanh(细胞状态)
+```
+
+#### 为什么 LSTM 能避免梯度消失
+
+关键在于**细胞状态 C_t 的更新方式**：
+
+```
+C_t = f_t * C_{t-1} + i_t * C'_t
+```
+
+- 遗忘门 f_t 接近 1 时，梯度可以几乎无损地传回很久以前的时间步
+- 加法操作（而非连乘）是 LSTM 避免梯度消失的核心：**∂C_t/∂C_{t-1} = f_t**，不是连乘
+- 梯度沿细胞状态路径传递时，"*"操作被"+"替代，梯度传播变成加法而非乘法
+
+#### packed_padded_sequence 与 padding mask
+
+处理变长序列时，需要 pad 后一起 batch，但 pad 的位置不应参与计算：
+
+```python
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+# 变长序列
+lengths = [5, 3, 7]  # 各序列实际长度
+x_padded = torch.nn.utils.rnn.pad_sequence([...], batch_first=True)
+
+# 打包（按长度降序，自动处理 pad）
+packed = pack_padded_sequence(x_padded, lengths, batch_first=True, enforce_sorted=True)
+output_packed, (hn, cn) = lstm(packed)
+
+# 解包
+output, _ = pad_packed_sequence(output_packed, batch_first=True)
+# output[:, 3, :] 在 lengths[0]=5 时，位置3的数据是真实的，位置>3是 pad 的
+```
+
+---
+
+### nn.Softmax / LogSoftmax — 归一化指数函数
+
+```python
+import torch.nn as nn
+
+sm = nn.Softmax(dim=-1)
+log_sm = nn.LogSoftmax(dim=-1)  # 用于 CrossEntropyLoss（数值稳定）
+
+x = torch.tensor([1., 2., 3.])
+y = sm(x)  # [e^1, e^2, e^3] / (e^1+e^2+e^3) ≈ [0.09, 0.24, 0.67]
+y_log = log_sm(x)  # log([...]) ≈ [-2.41, -1.41, -0.41]
+```
+
+**dim 很重要**：在哪个维度做 softmax，就在哪个维度做归一化（和为 1）。
+
+```python
+# (batch, seq_len, vocab_size) = (2, 5, 10000)
+logits = torch.randn(2, 5, 10000)
+sm = nn.Softmax(dim=-1)  # ← 在 vocab_size 维度归一化 → 每词概率分布
+attn_weights = sm(logits)  # 每个位置一个概率分布
+```
+
+---
+
+### 激活函数对比总结
+
+| 激活函数 | 公式 | 输出范围 | 优点 | 缺点 |
+|---------|------|---------|------|------|
+| **ReLU** | max(0, x) | [0, +∞) | 计算快、无梯度饱和 | 神经元死亡问题 |
+| **LeakyReLU** | x if x>0 else α·x | (-∞, +∞) | 避免神经元死亡 | 多了超参 α |
+| **GELU** | x·Φ(x) | (-∞, +∞) | Transformer 最常用，平滑 | 计算略慢 |
+| **SiLU / Swish** | x·sigmoid(x) | (-∞, +∞) | 自门控，比 ReLU 更平滑 | 计算慢 |
+| **Sigmoid** | 1/(1+e^{-x}) | (0, 1) | 概率输出 | 梯度易饱和、梯度消失 |
+| **Tanh** | (e^x - e^{-x})/(e^x + e^{-x}) | (-1, 1) | 零中心 | 梯度易饱和 |
+
+**工程选择**：
+- CNN / 通用 → **ReLU**（最快）
+- Transformer / Attention → **GELU**（BERT、ViT、GPT 等）
+- 需要概率输出 → **Sigmoid**（多标签分类）
+- 非线性输出 → **Tanh**（LSTM 门控内部常用）
+
+**GELU vs ReLU**：GELU 是 ReLU 的平滑近似，梯度在负区间也有小幅非零值，不会完全"死亡"。Transformer 时代 GELU 成为默认选择。
 
 ---
 
