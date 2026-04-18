@@ -1168,48 +1168,69 @@ attn_weights = sm(logits)  # 每个位置一个概率分布
 
 ## 3-6 Sequential 与模块化设计
 
-### nn.Sequential — 快速串联
+### nn.Sequential — 两种定义方式
 
 ```python
 import torch
 import torch.nn as nn
 
-# 方式一：直接传入层
+# 方式一：直接传入（位置索引，调试不方便）
 model = nn.Sequential(
     nn.Linear(10, 8),
     nn.ReLU(),
     nn.Linear(8, 4),
     nn.ReLU(),
-    nn.Linear(4, 2),
-    nn.Sigmoid()
+    nn.Linear(4, 2)
 )
-
-x = torch.randn(5, 10)
-print(model(x).shape)  # (5, 2)
 ```
 
 ```python
-# 方式二：使用 OrderedDict 命名层（方便调试）
+# 方式二：OrderedDict 命名（推荐，调试友好）
 from collections import OrderedDict
 
 model = nn.Sequential(OrderedDict([
-    ('conv1', nn.Conv2d(1, 20, 5)),
+    ('fc1',   nn.Linear(10, 8)),
     ('relu1', nn.ReLU()),
-    ('conv2', nn.Conv2d(20, 20, 5)),
+    ('fc2',   nn.Linear(8, 4)),
     ('relu2', nn.ReLU()),
-    ('pool', nn.MaxPool2d(2, 2)),
+    ('fc3',   nn.Linear(4, 2))
 ]))
-
-for name, module in model.named_children():
-    print(f"  {name}: {module}")
 ```
 
-### 何时不用 Sequential
+### Sequential 内部如何工作
 
-Sequential 适合**线性串联**的场景。如果有**分支、跳跃连接、多个输入输出**，就必须自定义 Module：
+Sequential 本身就是一个 `nn.Module`，`forward` 按顺序执行每一层：
 
 ```python
-# 残差连接：必须自定义，不能用 Sequential
+# Sequential 内部 forward 等价于：
+def forward(self, x):
+    for layer in self._modules.values():
+        x = layer(x)
+    return x
+```
+
+**OrderedDict vs 直接传入的区别**：两者功能完全相同，OrderedDict 只是给每一层起了名字，使得 `named_children()` 和 `state_dict()` 的 key 更清晰。
+
+```python
+for name, module in model.named_children():
+    print(name, '→', module)
+
+# OrderedDict 输出：
+# fc1 → Linear(in=10, out=8)
+# relu1 → ReLU()
+# fc2 → Linear(in=8, out=4)
+# relu2 → ReLU()
+# fc3 → Linear(in=4, out=2)
+```
+
+### Sequential 的局限：四种必须自定义的场景
+
+Sequential 只能**线性串联**，以下四种情况必须自定义 Module：
+
+**1. 残差连接**
+
+```python
+# Sequential 实现不了，必须自定义
 class ResidualBlock(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -1220,20 +1241,63 @@ class ResidualBlock(nn.Module):
         )
 
     def forward(self, x):
-        return self.net(x) + x  # 跳跃连接 ← Sequential 实现不了
+        return self.net(x) + x  # ← 跳跃连接
 ```
+
+**2. 多输入**
 
 ```python
-# 多输入：必须自定义
-class MultiInputNet(nn.Module):
+# 多输入必须自定义
+class TextImageFusion(nn.Module):
     def __init__(self):
         super().__init__()
-        self.img_net = nn.Linear(512, 128)
-        self.text_net = nn.Linear(768, 128)
+        self.text_net = nn.Linear(768, 256)
+        self.img_net  = nn.Linear(512, 256)
 
-    def forward(self, img, text):
-        return self.img_net(img) * self.text_net(img)  # 元素乘法
+    def forward(self, text, img):
+        return self.text_net(text) * self.img_net(img)  # ← 多输入
 ```
+
+**3. 多输出**
+
+```python
+# 多输出必须自定义
+class DualOutputNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.classifier = nn.Linear(512, 10)
+        self.embedding  = nn.Linear(512, 128)
+
+    def forward(self, x):
+        return {
+            'logits': self.classifier(x),
+            'features': self.embedding(x)
+        }
+```
+
+**4. 共享层**
+
+```python
+# 同一层在两处使用，必须自定义
+class SiameseNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.shared = nn.Linear(512, 256)  # ← 两处共享
+
+    def forward(self, x1, x2):
+        return self.shared(x1), self.shared(x2)  # ← 同一层走两次
+```
+
+### Sequential 适用场景对照表
+
+| 场景 | Sequential | 自定义 Module |
+|------|-----------|--------------|
+| 线性串联：Conv → BN → ReLU → Pool | ✅ | ✅ |
+| 快速原型：几行搭一个 MLP | ✅ | ✅ |
+| 残差连接（ResNet Block） | ❌ | ✅ |
+| 多分支网络（FPN、Inception、U-Net） | ❌ | ✅ |
+| 多输入/多输出（多模态） | ❌ | ✅ |
+| 共享层（Siamese Network） | ❌ | ✅ |
 
 ### 模型设计的分层思维
 
@@ -1272,6 +1336,12 @@ class CNN(nn.Module):
         x = x.mean(dim=[2, 3])  # Global Average Pooling
         return self.fc(x)
 ```
+
+### 实际工程选择原则
+
+- **简单任务 / 原型验证** → Sequential 够用，几行代码搞定
+- **生产级 / 复杂结构** → 自定义 Module（更清晰可控，可读性好）
+- **永远不确定** → 自定义 Module，因为后续改起来容易
 
 ---
 
