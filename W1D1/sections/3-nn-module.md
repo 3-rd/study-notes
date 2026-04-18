@@ -750,6 +750,253 @@ Winograd 2015-2016 年被工程化后，广泛用于 CNN 推理优化（如 Tens
 
 ---
 
+### 卷积的工程实现：从 for 循环到 im2col 到 cuDNN
+
+#### 为什么 for 循环做卷积极慢
+
+用 for 循环实现单次卷积：
+```python
+# 最 naive 的实现（假设 stride=1, padding=0）
+for oh in range(out_h):
+    for ow in range(out_w):
+        for kh in range(kernel_h):
+            for kw in range(kernel_w):
+                val += input[oh+kh, ow+kw] * kernel[kh, kw]
+        output[oh, ow] = val
+```
+
+四层嵌套 + 大量内存访问 → 极慢，无法利用并行。
+
+#### im2col：把卷积变成矩阵乘法
+
+**核心思想**：把输入的每个滑动窗口"展开"成列，把滤波器展开成行，然后做一次矩阵乘。
+
+```
+输入 (H×W) + 滤波器 (K×K)
+↓ im2col 展开
+矩阵 A (out_h×out_w, K×K)  ×  矩阵 B (K×K, out_channels)
+↓                            ↓
+每个滑动窗口拉成一列          每个滤波器拉成一行
+输出 (out_h×out_w, out_channels)
+```
+
+以 4×4 输入、3×3 滤波器、stride=1 为例：
+```
+输入:
+  [d00,d01,d02,d03]
+  [d10,d11,d12,d13]
+  [d20,d21,d22,d23]
+  [d30,d31,d32,d33]
+
+im2col 展开后矩阵 A (4×9):
+  [d00,d01,d02,d10,d11,d12,d20,d21,d22]   ← 第1个输出位置的窗口
+  [d01,d02,d03,d11,d12,d13,d21,d22,d23]   ← 第2个位置的窗口
+  [d10,d11,d12,d20,d21,d22,d30,d31,d32]
+  [d11,d12,d13,d21,d22,d23,d31,d32,d33]
+
+滤波器展开成矩阵 B (9×1):
+  [k00]
+  [k01]
+  [k02]
+  [k10]
+  [k11]
+  [k12]
+  [k20]
+  [k21]
+  [k22]
+
+输出 = A @ B  →  矩阵乘!
+```
+
+**为什么 im2col 快**：调用高度优化的 BLAS（CPU 上 MKL/OpenBLAS，GPU 上 cuBLAS）矩阵乘，并行度极高。
+
+**内存代价**：im2col 展开后的矩阵 A 有冗余（重叠窗口的数据被重复复制）。但换来的矩阵乘速度提升远大于内存开销。
+
+#### cuDNN：NVIDIA 的卷积底座
+
+cuDNN 是 NVIDIA 提供的深度学习基础库，PyTorch/TensorFlow 等框架的卷积底层都调用它。
+
+**cuDNN 选择算法的方式**：
+cuDNN 内部维护多种卷积算法（GEMM-based im2col、Winograd、FFTW 等），每次运行时会对输入 shape 做一次"autotune"——在候选算法上跑一个小算例，选最快的那个缓存下来。
+
+```python
+# PyTorch 调用 cuDNN 的示意路径
+conv = nn.Conv2d(3, 64, 3)
+x = torch.randn(1, 3, 224, 224)
+
+# 实际执行路径：
+# 1. PyTorch 解析 conv 参数，构造 cudnnConvolutionDescriptor
+# 2. cuDNN 根据 shape 调用 cudnnGetConvolutionForwardAlgorithm (autotune)
+# 3. cuDNN 执行选中的算法（im2col + cuBLAS / Winograd / FFTW）
+# 4. 结果返回 PyTorch tensor
+```
+
+**cuDNN 7 种卷积算法**（按场景选用）：
+| 算法 | 适用场景 |
+|------|---------|
+| GEMM (im2col) | 通用，k×k 大滤波器、large batch |
+| Winograd F(2×2, 3×3) | 小滤波器 (3×3)，中等 batch |
+| Winograd F(4×4, 3×3) | 较大 tile，batch 大时更明显 |
+| FFT | 极大滤波器 (5×5, 7×7)，但内存开销大 |
+| Implicit GEMM | 融合了 im2col，不需显式展开，内存更省 |
+
+**cuDNN vs cuBLAS**：cuBLAS 是通用矩阵乘，cuDNN 在其基础上做了 im2col 打包 + filter 打包，然后调 cuBLAS。cuDNN = cuBLAS + im2col + 算法选择 + 反向传播支持。
+
+#### 三种卷积实现的对比
+
+| 实现方式 | 并行度 | 适用场景 | 内存开销 |
+|---------|--------|---------|---------|
+| for 循环 | 极低 | 教学/验证 | 低 |
+| im2col + cuBLAS | 高（矩阵乘） | CPU / 通用 GPU | 中（需展开） |
+| cuDNN (autotune) | 最高 | 实际生产 | 可控 |
+
+实际项目中，永远用 cuDNN，PyTorch 默认就调用它，不需要手动指定。
+
+---
+
+### 经典 CNN 网络结构（PyTorch 视角）
+
+以下所有模型均可通过 `torchvision.models` 直接加载。
+
+#### LeNet-5（1998）— 开创者
+
+```
+Input(1×32×32)
+→ Conv(6, 5×5, s=1) → AvgPool(2×2)
+→ Conv(16, 5×5, s=1) → AvgPool(2×2)
+→ FC(120) → FC(84) → FC(10)
+```
+**特点**：2 conv + 3 fc，激活用 Sigmoid，汇聚用 AvgPool。
+
+#### AlexNet（2012）— 深度学习复兴
+
+```
+Input(3×224×224)
+→ Conv(96, 11×11, s=4) → MaxPool(3×3)
+→ Conv(256, 5×5, padding=2) → MaxPool(3×3)
+→ Conv(384, 3×3, p=1) × 3
+→ FC(4096) → FC(4096) → FC(1000)
+```
+**贡献**：ReLU 激活、Dropout、GPU 并行训练、Data Augmentation。
+
+#### VGG-16/19（2014）— 简洁即美
+
+```
+VGG-16:
+Input
+→ Conv(64)×2          → MaxPool
+→ Conv(128)×2         → MaxPool
+→ Conv(256)×3         → MaxPool
+→ Conv(512)×3         → MaxPool
+→ Conv(512)×3         → MaxPool
+→ FC(4096) → FC(4096) → FC(1000)
+```
+**贡献**：全部用 3×3 小滤波器 + 2×2 MaxPool，堆叠深；证明了深度是提升性能的关键。
+
+**为什么小滤波器堆叠 > 大滤波器**：
+- 2 个 3×3 的感受野 = 5×5，且参数量更少（2×9 vs 25）
+- 3 个 3×3 的感受野 = 7×7，参数量更少且多了非线性层
+
+#### GoogLeNet / Inception（2014）— 多尺度并行
+
+**核心模块 Inception**：
+```
+         → Conv(1×1) → Conv(3×3) ─┐
+input → Conv(1×1) ─┬→ Conv(5×5) ─┤→ concat
+         → Conv(1×1) → MaxPool(3×3) ─┘
+```
+同时用 1×1、3×3、5×5 卷积 + pooling，多尺度并行提取特征，最后 concat。
+
+**1×1 卷积的作用**：降维（减少参数量）+ 跨通道信息整合。
+
+#### ResNet（2015）— 残差革命
+
+**核心：残差连接**
+```python
+# 普通卷积块
+def plain_block(x):
+    return conv_layers(x)
+
+# 残差块
+def residual_block(x):
+    out = conv_layers(x)
+    return out + x  # 跳跃连接 ← 关键！
+```
+
+数学上：y = F(x) + x，对 F 求导时路径上有恒等梯度 1 → **从根本上解决梯度消失**。
+
+```
+ResNet-50:
+Input
+→ Conv(64, 7×7, s=2) → MaxPool
+→ Conv(64, 1×1) → Conv(64, 3×3) → Conv(256, 1×1)  × 3    (stage2)
+→ Conv(128, 1×1) → Conv(128, 3×3) → Conv(512, 1×1)  × 4    (stage3)
+→ Conv(256, 1×1) → Conv(256, 3×3) → Conv(1024, 1×1) × 6    (stage4)
+→ Conv(512, 1×1) → Conv(512, 3×3) → Conv(2048, 1×1) × 3    (stage5)
+→ GlobalAvgPool → FC(1000)
+```
+
+#### MobileNet V1/V2/V3（2017-2019）— 移动端优先
+
+**MobileNet V1：Depthwise Separable Convolution**
+```python
+# 普通卷积: groups=1, 所有通道一起算
+# Depthwise: groups=in_channels, 每个通道独立算
+# Pointwise: 1×1 卷积，跨通道混合
+
+x → DepthwiseConv(k×k) → PointwiseConv(1×1) → ReLU6
+```
+
+参数量对比：普通 Conv(K×K×Cin×Cout) vs Depthwise(K×K×Cin) + Pointwise(1×1×Cin×Cout)
+→ 约减少 K² 倍参数。
+
+**MobileNet V2：Inverted Residual + Linear Bottleneck**
+```
+输入 → 1×1 升维 → 3×3 Depthwise → 1×1 降维 → output
+                ↑                       ↓
+              shortcut (只在扩展后维度相同时才有)
+```
+
+**MobileNet V3**：用了 NAS（神经网络搜索）找最优结构 + SE（Squeeze-and-Excitation）注意力。
+
+#### 经典网络对比总结
+
+| 网络 | 年份 | 参数量 | 创新点 | 适用场景 |
+|------|------|--------|--------|---------|
+| LeNet-5 | 1998 | ~60K | 开创 CNN | MNIST |
+| AlexNet | 2012 | ~60M | ReLU + Dropout + GPU | 图像分类基准 |
+| VGG-16 | 2014 | ~138M | 全 3×3 小滤波器堆叠 | 预训练 backbone |
+| GoogLeNet | 2014 | ~5M | Inception 多尺度 | 移动端 |
+| ResNet-50 | 2015 | ~25.5M | 残差连接 | **最通用 backbone** |
+| MobileNetV3 | 2019 | ~5.4M | NAS + SE 注意力 | 移动端/边缘 |
+
+**实际工程选择**：
+- 通用 backbone → **ResNet-50**（精度/参数量均衡）
+- 移动端/边缘 → **MobileNetV3**
+- 需要丰富多尺度特征 → **FPN / RetinaNet** 等目标检测专用 backbone
+
+#### PyTorch 加载示例
+
+```python
+import torchvision.models as models
+
+# 方式一：预训练权重（推荐）
+resnet = models.resnet50(weights='IMAGENET1K_V1')
+alexnet = models.alexnet(weights='IMAGENET1K_V1')
+vgg16 = models.vgg16(weights='IMAGENET1K_V1')
+mobilenet = models.mobilenet_v3_small(weights='IMAGENET1K_V1')
+
+# 方式二：去掉分类头，做特征提取
+resnet = models.resnet50(weights='IMAGENET1K_V1')
+resnet = nn.Sequential(*list(resnet.children())[:-1])  # 去掉 FC 层
+features = resnet(torch.randn(1, 3, 224, 224))  # (1, 2048, 1, 1)
+
+# 方式三：迁移学习（换头）
+resnet.fc = nn.Linear(2048, 10)  # 换成自己的 10 类分类头
+```
+
+---
+
 ## 3-6 Sequential 与模块化设计
 
 ### nn.Sequential — 快速串联
