@@ -585,6 +585,169 @@ pretrained = nn.Embedding.from_pretrained(torch.randn(10000, 128))
 pretrained.weight.requires_grad = False  # 冻结，只fine-tune顶层
 ```
 
+#### Embedding 前向传播：数学等价 vs 工程实现
+
+Embedding 在数学上等价于 one-hot 向量与 embedding 矩阵的矩阵乘法，但工程实现是直接内存索引，两者路径不同但结果相同：
+
+| 视角 | 实现 | 路径 |
+|------|------|------|
+| **数学上** | `one_hot(token_id) @ embedding_table` | 构造稀疏向量 → 矩阵乘 → 得到向量 |
+| **工程上** | `embedding_table[token_id]` | 直接地址寻址，无矩阵运算 |
+
+工程上就是 `array[index]` 的直接寻址，和哈希表查表没有本质区别。数学上写成矩阵乘法是为了理论推导方便。
+
+#### Embedding 反向传播：梯度怎么传
+
+核心逻辑：**谁用过我，谁把梯度传给我**。
+
+```python
+import torch
+import torch.nn as nn
+
+emb = nn.Embedding(num_embeddings=10000, embedding_dim=128)
+optimizer = torch.optim.SGD(emb.parameters(), lr=0.01)
+
+# 模拟前向：token_id=42 被使用了两次
+input_ids = torch.tensor([42, 7, 42, 99])
+
+# 前向
+vec = emb(input_ids)  # shape: (4, 128)
+loss = vec.sum()       # 简单 loss
+
+# 反向
+loss.backward()
+
+# 验证：token_id=42 被使用了两次，梯度应该累加
+print("emb.weight.grad[42]:", emb.weight.grad[42])  # 非零梯度
+print("emb.weight.grad[7]:", emb.weight.grad[7])    # 非零梯度
+print("emb.weight.grad[99]:", emb.weight.grad[99])  # 非零梯度
+print("emb.weight.grad[0]（未使用）:", emb.weight.grad[0])  # 接近零
+```
+
+**关键行为**：
+- 同一个 token 被多次查询（重复词）→ **梯度累加**
+- 没被查过的 token → 梯度为 0，不参与更新
+- 计算量正比于 token 数（batch × seq_len），不依赖词表大小
+
+#### 预训练词向量加载与微调策略
+
+实际工程中几乎不会从零训练 embedding，而是加载预训练向量：
+
+```python
+import torch
+import torch.nn as nn
+
+# 方式一：from_pretrained 加载
+pretrained_vectors = torch.randn(10000, 128)  # 实际从 glove/word2vec 加载
+emb = nn.Embedding.from_pretrained(pretrained_vectors, freeze=False)
+# freeze=False: 训练时继续更新向量（fine-tune）
+# freeze=True:  训练时冻结，当静态特征用
+```
+
+**四种微调策略**：
+
+| 策略 | 做法 | 适用场景 |
+|------|------|---------|
+| **Frozen** | `weight.requires_grad = False`，不更新 | 数据量小、领域差异大 |
+| **Full Fine-tune** | 全部可训练，正常更新 | 数据量大、领域相近 |
+| **Gradual Unfreezing** | 先冻住 → 逐步解冻 | 中等数据量，避免灾难性遗忘 |
+| **Adapter** | 冻住主模型，附加小型 MLP 适配器 | 算力有限、保留主模型能力 |
+
+```python
+# Gradual Unfreezing 示例：先只训练 head，逐步解冻
+model = torchvision.models.resnet18(pretrained=True)
+
+# 阶段1：只训练分类头
+for param in model.parameters():
+    param.requires_grad = False
+model.fc.weight.requires_grad = True
+
+# 训练若干 epoch 后...
+# 阶段2：解冻最后两层
+for param in model.layer4.parameters():
+    param.requires_grad = True
+
+# 阶段3：更多层...
+optimizer = torch.optim.SGD(
+    [p for p in model.parameters() if p.requires_grad],
+    lr=1e-3  # 解冻后用较小学习率
+)
+```
+
+---
+
+### Winograd 卷积优化算法
+
+Winograd 算法是深度学习中常用的卷积计算优化技术，核心思想是将卷积中的乘法次数减少。
+
+#### 一维 Winograd F(m, r)：矩阵乘视角
+
+以 F(2, 3) 为例：输入 4 点 `d = [d0, d1, d2, d3]`，滤波器 3 点 `g = [g0, g1, g2]`，输出 2 点：
+
+**直接卷积**（6 次乘）：
+```
+y0 = d0·g0 + d1·g1 + d2·g2
+y1 = d1·g0 + d2·g1 + d3·g2
+```
+
+**Winograd 重写形式**：输入组织成 2×3 数据矩阵，滤波器作为 3×1 向量：
+```
+D = [d0, d1, d2; d1, d2, d3]   (2×3)
+y = D · g                        (矩阵乘)
+```
+这只是一个框架，Winograd 的精妙之处在于：**数据 D 和滤波器 g 都做预变换**，使得主要乘法变成元素乘。
+
+**Winograd 完整公式**：
+```
+y = A^T · (G·g ⊙ B^T·d)
+```
+
+| 步骤 | 操作 | 计算类型 |
+|------|------|---------|
+| `B^T·d` | 输入变换（4 → 4 点） | 只有加减，无乘 |
+| `G·g` | 滤波器变换（3 → 3 点） | 只有加减，无乘 |
+| `⊙` | 逐元素乘（4 次） | **只有乘** |
+| `A^T` | 输出组合（4 → 2 点） | 只有加减，无乘 |
+
+**总乘法数**：从 6 次降到 **4 次**，代价是十几步加减法。在硬件上乘比加贵得多，所以合算。
+
+#### Winograd F(m, r) 一般形式
+
+Winograd 不是只能 F(2,3)，而是有很多组 (m, r) 可选：
+
+| 形式 | 输出 m | 滤波器 r | 输入点数 | 直接乘法 | Winograd 乘法 |
+|------|--------|---------|---------|---------|--------------|
+| F(2, 3) | 2 | 3 | 4 | 6 | **4** |
+| F(4, 3) | 4 | 3 | 6 | 12 | **6** |
+| F(6, 3) | 6 | 3 | 8 | 18 | **8** |
+| F(2, 5) | 2 | 5 | 6 | 10 | **6** |
+
+**选大 m 的权衡**：m 越大乘法节省比例越高，但变换矩阵复杂度增加、数值稳定性变差。实际深度学习中选择 F(4,3) 或 F(16,3) 等。
+
+#### 二维 Winograd F(2×2, 3×3)：Khatri-Rao 视角
+
+对于 4×4 输入和 3×3 滤波器，可以分块成 2×3 的 tile，每个 tile 做 2D 卷积：
+
+- 输入 4×4 → 分成重叠的 2×3 块（每个块覆盖一个 2×2 输出区域）
+- 每个块是 **2×3 小矩阵**，滤波器是 **3×3 小矩阵**
+- 2D 卷积等效为：每个 2×3 块与 3×3 滤波器的矩阵乘
+
+这就是 **Khatri-Rao 乘积**（列对列的逐元素乘）的形式推广。二维 Winograd 的核心洞察：**空间分块 + 滤波器 Khatri-Rao 展开**，使得主要运算变成逐元素乘。
+
+#### 输入不能整除 tile 怎么办
+
+三种处理方式：
+
+**1. 补零（Zero Padding）**：不够的地方补 0，继续用标准 tile，最常用
+
+**2. 剩余处理（Guard / Tail）**：先用标准 tile 覆盖主体，剩下几个点单独用直接卷积（量小，浪费一点乘法无所谓）
+
+**3. 动态选择 tile 大小**：输入长度不是 m 的倍数时，选不规则的最后 tile
+
+#### Winograd 在深度学习中的地位
+
+Winograd 2015-2016 年被工程化后，广泛用于 CNN 推理优化（如 TensorFlow、TensorRT）。但近几年，随着 Tensor Core 等专用矩阵乘硬件的普及，Winograd 在大 tile 场景的优势被削弱——硬件直接做矩阵乘已经足够快。但在**小滤波器（3×3）、中等 batch** 的场景下，Winograd 仍然是重要的优化手段。
+
 ---
 
 ## 3-6 Sequential 与模块化设计

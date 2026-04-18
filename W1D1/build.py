@@ -147,7 +147,8 @@ NN_MD = new_markdown_cell("""## 三、`nn.Module` — 模型构建核心
 | `named_parameters()` / `parameters()` | 遍历模型参数 | 如何冻结部分层 |
 | `state_dict()` / `load_state_dict()` | 模型序列化/加载 | 怎么只加载部分参数 |
 | `children()` / `modules()` | 遍历子模块 | 区别是什么 |
-| 常见层 | `Linear / Conv2d / BatchNorm / Dropout / LSTM` | 参数含义 |
+| 常见层 | `Linear / Conv2d / BatchNorm / Dropout / LSTM / Embedding` | 参数含义 |
+| Winograd | 卷积计算优化算法 | F(m,r) 通用形式 |
 
 **⚠️ 面试必答题：**
 - `nn.Module` 的 `forward` 为什么只需写前向，反向自动搞定？
@@ -166,6 +167,22 @@ if os.path.exists(_nn_path):
             cells.append(new_markdown_cell(_content))
         elif _kind == 'code' and _content.strip():
             cells.append(new_code_cell(_content))
+
+# 读取 3-5 层的额外子章节文件（Embedding 进阶 + Winograd）
+_extra_subs = [
+    # (filename, title)  — 这些文件是 3-5 的补充内容
+]
+_extra_dir = os.path.join(DIR, 'sections')
+for _fname in ['3-5-embedding.md', '3-5-winograd.md']:
+    _fpath = os.path.join(_extra_dir, _fname)
+    if os.path.exists(_fpath):
+        _text = open(_fpath, encoding='utf-8').read()
+        _parsed = split_cells(_text)
+        for _kind, _content in _parsed:
+            if _kind == 'md' and _content.strip():
+                cells.append(new_markdown_cell(_content))
+            elif _kind == 'code' and _content.strip():
+                cells.append(new_code_cell(_content))
 
 OPTIM_MD = new_markdown_cell("""## 四、`torch.optim` — 优化器
 
