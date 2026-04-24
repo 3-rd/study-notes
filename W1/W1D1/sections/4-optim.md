@@ -26,60 +26,104 @@
 
 ### SGD（随机梯度下降）
 
-PyTorch 中 `SGD` 实际上是大 batch 的梯度下降（不一定是单样本）。
+**核心**：每一步独立更新，看当前梯度，不依赖历史。
 
 ```python
-import torch
-import torch.nn as nn
-
-model = nn.Linear(10, 2)
-optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-
-# 训练循环
-for inputs, targets in dataloader:
-    optimizer.zero_grad()
-    outputs = model(inputs)
-    loss = nn.MSELoss()(outputs, targets)
-    loss.backward()
-    optimizer.step()
+Δw = lr × gradient
+w = w - Δw
 ```
 
-**关键参数：**
-- `lr`: 学习率
-- `momentum`: 动量系数（默认 0）
-- `weight_decay`: L2 正则化系数
+**特点**：
+- 稳定，但收敛慢（特别是缓坡）
+- 学习率调不好容易震荡
 
 ### Momentum（动量）
 
-物理概念：像滚动的球有惯性，梯度会累积。
+**核心**：历史梯度的指数加权累积，再用来更新参数。
 
 **公式：**
-```
-v_t = γ * v_{t-1} + lr * gradient
-param = param - v_t
-```
-
-- γ（gamma）: 动量系数，通常 0.9
-- lr: 学习率
-
 ```python
-# 有动量 vs 无动量
-optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-# 对比
-optimizer_no_mom = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0)
+momentum = γ × momentum + lr × gradient
+w = w - momentum
 ```
+
+**展开形式（关键）：**
+```
+momentum_t = lr × [g_t + γ·g_{t-1} + γ²·g_{t-2} + γ³·g_{t-3} + ...]
+```
+
+- γ=0.9 时，10步前的梯度权重只剩约 35%
+- 所以 momentum ≈ 过去 ~10 步梯度的加权平均 × lr
+- **本质：参数更新量 = lr × 历史梯度的指数加权累积**
+
+**直观例子**（lr=0.1, γ=0.9, momentum=0）：
+
+| Step | 当前梯度 | Momentum | 参数更新 Δw | 累计更新 |
+|------|---------|---------|-----------|---------|
+| 1 | 3.0 | 0.9×0 + 0.1×3.0 = 0.30 | -0.30 | -0.30 |
+| 2 | 2.0 | 0.9×0.30 + 0.1×2.0 = 0.47 | -0.47 | -0.77 |
+| 3 | 1.0 | 0.9×0.47 + 0.1×1.0 = 0.52 | -0.52 | -1.29 |
+| 4 | 0.5 | 0.9×0.52 + 0.1×0.5 = 0.52 | -0.52 | -1.81 |
+
+**vs 无动量SGD**（同样4步梯度）：累计更新只有 **-0.65**，动量版是 **-1.81**，快了近3倍。
 
 **为什么能加速：**
-- 减少振荡：在梯度变化方向一致的维度累积，在振荡方向抵消
-- 加速收敛：在损失谷底时，惯性帮助跳出局部极小
+- 方向一致：速度累积，越走越快
+- 方向振荡：正负抵消，自动过滤噪音
+
+**为什么叫"动量"**：物理上像滚球下山，即使坡度变缓，惯性也会推着继续滚。
 
 ### Nesterov 动量
 
-是 Momentum 的改进版，先按动量方向预估，再计算梯度。
+**核心**：先按惯性走一步，在那个位置预判梯度，再回来更新。
 
+```python
+preview_w = w - γ × momentum          # 预判位置（先按惯性走）
+gradient_preview = 在 preview_w 处算的梯度  # 预判梯度
+momentum = γ × momentum + lr × gradient_preview
+w = w - momentum
+```
+
+**直观理解**：
+- 普通 Momentum：低头冲，撞到墙才减速
+- Nesterov：抬头看路，快到墙了提前减速
+
+**代码：**
 ```python
 optimizer = torch.optim.SGD(model.parameters(), lr=0.01, 
                            momentum=0.9, nesterov=True)
+```
+
+**三种方式对比**（lr=0.1, γ=0.9）：
+
+| | 无动量 SGD | 带动量 SGD | Nesterov |
+|---|---|---|---|
+| 每步更新 | lr × g_t | lr × [g_t + γ·g_{t-1} + ...] | 预判位置算梯度，累积同动量 |
+| 速度 | 无 | 有累积 | 有累积 |
+| 减速机制 | 无 | 靠当前梯度变小 | **提前**感知梯度变小 |
+| 4步累计更新 | -0.65 | -1.81 | 更稳（真实场景优于动量） |
+
+### zero_grad 三种方式
+
+梯度清零有三个入口，语义略有不同：
+
+```python
+optimizer.zero_grad()    # 优化器清零：只清它管理的那些参数的梯度
+model.zero_grad()       # 模型清零：递归清所有子模块的梯度
+for p in model.parameters():
+    p.grad = None       # 手动清零：最直接
+```
+
+**为什么 PyTorch 把 zero_grad 放在 optimizer 上？**
+- optimizer 创建时就绑定了要管理的参数
+- `optimizer.zero_grad()` = "把管的这批参数的梯度清零"
+- 语义自然：谁管谁清
+
+**PyTorch 默认累加梯度**（不是覆盖），方便大 batch：
+```python
+loss.backward()      # grad += 梯度
+loss.backward()      # grad += 新梯度（累加了！）
+optimizer.zero_grad()  # 下一步前必须清零
 ```
 
 ---
@@ -352,39 +396,9 @@ for inputs, targets in dataloader:
 
 ---
 
-## 4-8 zero_grad() + 状态保存
+## 4-8 优化器状态保存
 
-### zero_grad() 为什么必须手动调用
-
-PyTorch 默认 **累加梯度**（方便大 batch）。
-
-```python
-# 错误：梯度会爆炸
-for inputs, targets in dataloader:
-    outputs = model(inputs)
-    loss = loss_fn(outputs, targets)
-    loss.backward()  # 每次都在累加！
-    optimizer.step()
-
-# 正确
-for inputs, targets in dataloader:
-    optimizer.zero_grad()  # 先清零
-    outputs = model(inputs)
-    loss = loss_fn(outputs, targets)
-    loss.backward()
-    optimizer.step()
-```
-
-**set_to_none=True**（更高效）:
-
-```python
-optimizer.zero_grad(set_to_none=True)
-# 和 zero_grad() 等价，但内存更省（设为 None 而非 0）
-```
-
-### 参数状态保存
-
-optimizer 有内部状态（momentums 等），保存时必须一起保存。
+optimizer 有内部状态（如 Adam 的 momentum、方差估计），保存 checkpoint 时必须一起保存。
 
 ```python
 # 保存
@@ -402,7 +416,13 @@ optimizer.load_state_dict(checkpoint['optimizer'])
 epoch = checkpoint['epoch']
 ```
 
-**注意**：不同 optimizer 状态不兼容（Adam 的状态不能加载到 SGD）
+**注意**：不同 optimizer 状态结构不同，Adam 的 state_dict 不能加载到 SGD。
+
+**set_to_none=True**（更高效的清零方式）:
+```python
+optimizer.zero_grad(set_to_none=True)
+# 设为 None 而非 0，内存更省
+```
 
 ---
 
