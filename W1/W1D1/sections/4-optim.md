@@ -785,14 +785,23 @@ scheduler.step()     # 或 scheduler.step(val_loss)
 
 ## 4-8 优化器状态保存
 
-optimizer 有内部状态（如 Adam 的 momentum、方差估计），保存 checkpoint 时必须一起保存。
+### 为什么需要保存 optimizer state
+
+optimizer 内部为每个参数维护 state，比如：
+- **SGD with Momentum**：动量 m
+- **Adam**：一阶矩 m、二阶矩 v
+
+这些 state 包含了训练过程的"历史信息"，断点续训时不保存 optimizer state，直接从 epoch 50 继续会导致训练行为不一致（相当于从头初始化了 momentum）。
+
+### 保存与加载
 
 ```python
 # 保存
 checkpoint = {
     'model': model.state_dict(),
     'optimizer': optimizer.state_dict(),
-    'epoch': epoch
+    'epoch': 50,
+    'lr_scheduler': scheduler.state_dict()  # scheduler 也可以保存
 }
 torch.save(checkpoint, 'checkpoint.pth')
 
@@ -800,15 +809,20 @@ torch.save(checkpoint, 'checkpoint.pth')
 checkpoint = torch.load('checkpoint.pth')
 model.load_state_dict(checkpoint['model'])
 optimizer.load_state_dict(checkpoint['optimizer'])
-epoch = checkpoint['epoch']
+epoch = checkpoint['epoch'] + 1  # 从下一个 epoch 继续
+scheduler.load_state_dict(checkpoint['lr_scheduler'])
 ```
 
-**注意**：不同 optimizer 状态结构不同，Adam 的 state_dict 不能加载到 SGD。
+### 注意
 
-**set_to_none=True**（更高效的清零方式）:
+- 不同 optimizer 的 state 结构不同，Adam 的 state_dict 不能加载到 SGD
+- optimizer state 也是 fp32，显存消耗和模型参数相当（Adam 需要存 m 和 v 两份）
+
+### set_to_none=True（更高效的清零方式）
+
 ```python
 optimizer.zero_grad(set_to_none=True)
-# 设为 None 而非 0，内存更省
+# grad 设为 None 而非 0，内存更省，效果相同
 ```
 
 ---
