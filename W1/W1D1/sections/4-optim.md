@@ -351,38 +351,116 @@ optimizer = torch.optim.Adam(model.parameters(), lr=0.001,
 
 ## 4-4 AdamW vs Adam + L2
 
-### 核心区别
+### L1 / L2 正则化回顾
 
-**Adam + L2**：
-```
-grad = gradient + weight_decay * param
-m_t = β1 * m_{t-1} + (1-β1) * grad
-```
+**正则化的本质**：在损失函数里加一个额外目标，让参数不要太大，防止过拟合。
 
-**AdamW**：
 ```
-m_t = β1 * m_{t-1} + (1-β1) * gradient
-param = param - lr * (m_hat / √v_hat + weight_decay * param)
+总损失 = 原始损失 + 正则项
 ```
 
-区别：**L2 正则化通过梯度更新（影响动量估计）**，而 **AdamW 在参数更新时直接减（ weight_decay * param * lr）**。
+**L2 正则化**（权重衰减）：`(λ/2) × ||w||²`
+- 目标：让所有参数平方和更小
+- 梯度贡献：λ × w
+- 特点：参数都变小，但都不为 0
 
-### 为什么 AdamW 更好
+**L1 正则化**：`λ × ||w||₁`
+- 目标：让尽可能多参数变成 0
+- 梯度贡献：λ × sign(w)
+- 特点：稀疏化，特征选择
 
-1. **解耦**：学习率和正则化强度独立
-2. **理论保证**：与 L2 正则化的原始目标函数等价
-3. **实践效果**：通常 weight_decay 设置为 0.01~0.05（而非 Adam+L2 的 1e-4）
+**L2 vs L1 对比**：
+
+| | L2 | L1 |
+|---|---|---|
+| 公式 | (λ/2)Σw² | λΣ|w| |
+| 梯度 | 2λw | λ·sign(w) |
+| 特点 | 都变小，趋近0但不为0 | 变成0（特征选择）|
+| 大模型为什么用L2 | GPU擅长密集运算，稀疏化收益小；L1梯度不连续不稳定 | |
+
+### Adam + L2 的问题
+
+原始 Adam 论文**没有 L2 正则化**，只是优化 ∇L(w)。后来加了 weight_decay，但放的位置有问题：
+
+**Adam + L2（PyTorch 默认实现）**：
+```python
+grad = gradient + weight_decay * param  # L2 混入梯度
+m = β1·m + (1-β1)·grad                 # momentum 被污染
+v = β2·v + (1-β2)·grad²               # 方差估计也被污染
+```
+- L2 的梯度 λ·w 和真实损失梯度混在一起，一起参与 momentum 计算
+- momentum 的方向不再只反映真实损失，还被 L2 "往0压"的方向污染
+- 方差估计也被 L2 影响
+
+### AdamW（正确实现）
+
+**AdamW**：L2 根本不进梯度，单独在最后参数更新时处理：
+```python
+m = β1·m + (1-β1)·gradient  # 干净梯度
+v = β2·v + (1-β2)·gradient² # 干净方差
+w = w - lr·(m̂/√v̂ + λ·w)    # L2 单独处理，不进 m/v
+```
+
+### 代码实现对比
+
+**Adam（Adam + L2）**：
+```python
+# L2 在梯度里混入
+if weight_decay > 0:
+    grad = grad + weight_decay * p.data
+# 然后进入 m 和 v 的计算
+exp_avg.mul_(beta1).add_(grad, alpha=1-beta1)
+exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1-beta2)
+```
+
+**AdamW（解耦）**：
+```python
+# L2 不混入梯度
+exp_avg.mul_(beta1).add_(grad, alpha=1-beta1)
+exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1-beta2)
+# 参数更新后单独处理 L2
+p.data.add_(p.data, alpha=-lr * weight_decay)  # w = w - lr·λ·w
+```
+
+### weight_decay 数值：Adam vs AdamW 怎么对应
+
+两者的 λ 不能直接比，因为放置位置不同导致有效强度不同。
+
+AdamW 论文给出精确换算公式：
+```
+λ_adam ≈ λ_adamw × (1-β1) / √(1-β2)
+```
+
+代入 β1=0.9, β2=0.999：
+```
+(1-0.9) / √(1-0.999) = 0.1 / 0.0316 ≈ 3.16
+```
+
+所以：
+| AdamW λ | 等价 Adam+L2 λ |
+|---------|--------------|
+| 0.01 | ≈ 0.003 |
+| 0.05 | ≈ 0.016 |
+
+**论文推荐值**：
+- Adam + L2：λ = 1e-3 ~ 1e-4
+- AdamW：λ = 0.01 ~ 0.05
+
+### 一句话总结
+
+- Adam + L2：L2 进梯度，污染 momentum 和方差估计
+- AdamW：L2 不进梯度，单独在参数更新时处理，不污染
+- 数值对应：AdamW=0.01 ≈ Adam+L2=0.003（通过公式精确换算）
+
+### 代码
 
 ```python
-# Adam + L2（传统方式）
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+# Adam + L2（旧方式，不推荐）
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-3)
 
 # AdamW（推荐方式）
 optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
 ```
-
-**面试话术**：
-> "AdamW 是 Adam 的改进，把 weight_decay 从梯度项移到了参数更新项，避免了动量估计被 L2 正则化污染。实际应用中通常用 0.01-0.05 的 weight_decay，比 Adam+L2 的 1e-4 高两个数量级。"
 
 ---
 
