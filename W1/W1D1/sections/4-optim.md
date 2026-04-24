@@ -492,63 +492,92 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
 
 ## 4-5 学习率调度（lr_scheduler）
 
-### 常用策略
+### 为什么需要调度
 
-| 调度器 | 公式 | 适用场景 |
-|---|---|---|
-| StepLR | 每 N 个 epoch 固定衰减 | 普通训练 |
-| MultiStepLR | 指定 epoch 列表衰减 | 已知转折点 |
-| CosineAnnealingLR | 余弦曲线 | 图像分类 |
-| ReduceLROnPlateau | 指标不降时衰减 | 验证集优化 |
-| Warmup + Cosine | 先升后降 | Transformer |
+训练分阶段：
+- **前期**：参数离最优解远，需要大学习率快速下降
+- **中期**：接近最优解了，大 lr 会振荡
+- **后期**：lr 应该变小，精细调整
 
-### StepLR
+固定 lr = 0.01：前期快，但后期可能跳过最优点
+动态 lr：前期大步快跑，后期小步微调
+
+### 优化器 vs Scheduler
+
+- **优化器**（Adam/SGD）：拿到初始 lr，内部根据梯度自适应缩放每个参数的有效学习率
+- **lr_scheduler**：在优化器基础上，再对全局 lr 基准动手脚
+
+两者正交，可以同时用。scheduler 改 `optimizer.param_groups[0]['lr']`，optimizer 拿这个基准做自适应。
+
+### 核心机制
 
 ```python
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
 
 for epoch in range(50):
     train()
-    scheduler.step()
-    print(f"Epoch {epoch}: lr={optimizer.param_groups[0]['lr']}")
-# Epoch 0-9: 0.001
-# Epoch 10-19: 0.0005
-# Epoch 20-29: 0.00025
-# ...
+    scheduler.step()  # scheduler 改 optimizer 里的 lr 值
 ```
 
-### CosineAnnealingLR
+scheduler 本质：条件到了，改 `optimizer.param_groups[0]['lr']` 的值，机制简单。
+
+### 七种调度器对比
+
+| 调度器 | 中文名 | 公式 | 触发条件 | 适用场景 | 为什么适合 | 优点 | 缺点 |
+|--------|--------|------|---------|---------|---------|------|------|
+| **StepLR** | 阶梯衰减 | lr = lr₀ × γ^⌊epoch/s⌋ | 每 N 个 epoch 固定衰减 | 普通训练，不知道曲线怎么走 | 直觉：每隔一段时间降一降；工程：实现简单，step_size 和 gamma 两个超参好调 | 简单稳定 | 需要人工调，机械 |
+| **MultiStepLR** | 多阶梯衰减 | lr = lr₀ × γ^milestone_count | 指定 epoch 列表衰减 | 图像分类、目标检测，知道转折点 | 直觉：前期快、中期稳、后期精；工程：CV 训练经验（30/60/80 epoch 降） | 比 StepLR 灵活 | 需要人工指定 milestones |
+| **CosineAnnealingLR** | 余弦退火 | lr = η_min + (η_max - η_min) × (1 + cos(π·t/T_max))/2 | 余弦曲线，epoch 线性进行 | 大模型训练，Transformer，BERT/GPT | 直觉：先快后慢，结尾最精细；数学：余弦比阶梯平滑；工程：超参少，效果好，广泛验证 | 平滑不需调参 | 后期 lr 下降慢 |
+| **ReduceLROnPlateau** | 自适应衰减 | lr = lr × factor | 验证集指标不降时衰减 | 有验证集、指标明确的训练（翻译/分类/NLP） | 直觉：学不动了再降；工程：不用人工盯 epoch，有监控就能用 | 自适应，无需预知曲线 | 依赖指标质量，波动大时易误触发 |
+| **OneCycleLR** | 单周期衰减 | 先升后降：0→lr_max（线性）→lr_min（余弦） | epoch 线性进行，三阶段 | 小 batch 训练、GAN，强化学习、Transformer | 直觉：先探索再收敛；数学：max_lr 让模型跳出局部最优；工程：收敛快，泛化好，只需调 max_lr | 收敛最快，泛化好 | 需调 max_lr |
+| **ExponentialLR** | 指数衰减 | lr = lr₀ × γ^epoch | 每个 epoch 衰减 | 几乎不用，实验性调参探索 | 直觉：连续指数衰减；工程：几乎不用，衰减太激进 | 连续平滑 | 衰减太快，难调 |
+| **Warmup** | 预热 | lr = lr_target × (step / warmup_steps) | 前 N 个 step 线性上升 | Transformer 训练（标配） | 直觉：先学简单模式再学难的；数学：前几步梯度方向不稳定，小 lr 更安全；工程：前 0.1%~10% 步从小 lr 升到目标值，防止早期震荡 | 稳定训练过程 | 需额外配置 |
+
+### 补充说明
+
+**CosineAnnealing vs StepLR**：余弦不需要提前知道最佳衰减时间点，曲线自动平滑；StepLR 简单但有突变。
+
+**OneCycleLR 为什么收敛快**：max_lr 设置得当可以让模型在前期快速探索大参数空间，后期精细收敛，实践证明比恒定 lr 快 2-5 倍。
+
+**ReduceLROnPlateau 的问题**：指标波动大时会误触发，所以 patience 要设够（5~10 epoch），factor 不能太小（0.5 左右）。
+
+**实际组合**：大模型训练常用 `Warmup + CosineAnnealingLR`——前几个 epoch 预热，后面的 epoch 余弦退火，是 Transformer 的标准配置。
+
+### 代码
 
 ```python
+# StepLR
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+
+# CosineAnnealing
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)
-```
 
-### Warmup + Cosine（在 PyTorch 2.0+）
-
-```python
-scheduler = torch.optim.lr_scheduler.OneCycleLR(
-    optimizer, 
-    max_lr=0.1,
-    epochs=50,
-    steps_per_epoch=len(dataloader)
-)
-```
-
-###ReduceLROnPlateau
-
-```python
+# ReduceLROnPlateau
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode='min', factor=0.5, patience=5, verbose=True
 )
-
 for epoch in range(50):
     val_loss = validate()
-    scheduler.step(val_loss)  # 根据指标调整
+    scheduler.step(val_loss)  # 传入指标
+
+# OneCycleLR（Transformer 推荐）
+scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    optimizer, max_lr=3e-4,
+    epochs=50, steps_per_epoch=len(dataloader)
+)
+
+# Warmup + Cosine（手动实现）
+warmup_epochs = 5
+for epoch in range(50):
+    if epoch < warmup_epochs:
+        lr = base_lr * (epoch + 1) / warmup_epochs  # 线性预热
+    else:
+        progress = (epoch - warmup_epochs) / (50 - warmup_epochs)
+        lr = base_lr * 0.5 * (1 + math.cos(math.pi * progress))  # 余弦
 ```
 
 **面试话术**：
-> "常用的是 StepLR（简单）、CosineAnnealing（效果好）和 ReduceLROnPlateau（自动）。Transformer 类任务一般用 OneCycleLR 先升后降，能获得更好收敛。"
+> "常用的是 StepLR（简单）、CosineAnnealing（效果好）和 ReduceLROnPlateau（自动）。Transformer 类任务一般用 Warmup + CosineAnnealingLR，能获得更好收敛。"
 
 ---
 
