@@ -665,35 +665,102 @@ optimizer = torch.optim.AdamW([
 
 ### 为什么要裁剪
 
-防止梯度爆炸（尤其 LSTM、Transformer、GAN）。
+深层网络（Transformer、LSTM）训练时，梯度逐层累积放大，导致**梯度爆炸**：
 
-**常见阈值**：1.0 或 5.0
+```
+梯度爆炸：loss.backward() 后，参数梯度变成 NaN 或极大值
+→ 参数更新一步跳到无穷大
+→ 训练崩溃
+```
 
-### 两种方式
+### 事前防范 vs 事后防范
 
-#### nn.utils.clip_grad_norm_
-按全体参数 L2 范数裁剪：
+| 类型 | 方法 | 说明 |
+|------|------|------|
+| **事前防范** | 残差连接、归一化、合适初始化 | 模型结构设计层面，梯度根本不容易爆 |
+| **事后防范** | Gradient Clipping | 训练过程中兜底，已经爆了再裁 |
+
+残差/归一化是"大楼设计时抗震"，Gradient Clipping 是"地震来了再加固"。
+
+### clip_grad_norm_（常用）
+
+按全体参数 L2 范数裁剪，超过阈值等比例压缩：
 
 ```python
 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-# 计算方式
-total_norm = torch.sqrt(sum(torch.sum(p.grad ** 2) for p in model.parameters()))
-if total_norm > max_norm:
-    scale = max_norm / total_norm
-    for p in model.parameters():
-        p.grad *= scale
 ```
 
-#### nn.utils.clip_grad_value_
-按单个参数值裁剪：
+**计算方式**：
+```
+total_norm = √( ||grad_1||² + ||grad_2||² + ... + ||grad_n||² )
+scale = max_norm / total_norm
+p.grad = p.grad × scale  # 等比例压缩
+```
+
+**例子**：
+```
+grad = [3.0, 4.0]
+||grad|| = √(9+16) = 5.0
+total_norm = 5.0, max_norm = 1.0
+scale = 1.0 / 5.0 = 0.2
+更新后 = [0.6, 0.8]
+||grad|| = √(0.36+0.64) = 1.0 ✓
+```
+
+### clip_grad_value_（不常用）
+
+每个参数逐元素直接截断到 [-clip_value, clip_value]：
 
 ```python
 torch.nn.utils.clip_grad_value_(model.parameters(), clip_value=1.0)
-# 所有参数的梯度被裁到 [-1.0, 1.0]
+# grad[i] = min(max(grad[i], -1.0), 1.0)
 ```
 
-**推荐**：clip_grad_norm_（更常用）
+```
+原始：[3.0, -2.5, 0.3, 0.8]
+裁剪后：[1.0, -1.0,  0.3, 0.8]
+```
+
+**为什么不常用**：
+- 直接截断会改变梯度方向
+- 离群值（spike）会导致整体缩放剧烈波动
+- clip_grad_norm_ 是等比例缩放，保留方向信息
+
+### 执行时机
+
+**每 batch 执行一次**，在 backward() 之后、optimizer.step() 之前：
+
+```python
+for batch in dataloader:
+    optimizer.zero_grad()
+    outputs = model(batch)
+    loss = loss_fn(...)
+    loss.backward()                              # 算梯度
+    clip_grad_norm_(model.parameters(), 1.0)   # 每 batch 裁剪
+    optimizer.step()                            # 更新参数
+```
+
+### Batch 级别 vs Epoch 级别操作
+
+| 操作 | 执行时机 | 说明 |
+|------|---------|------|
+| optimizer.zero_grad() | 每 batch | |
+| forward + loss | 每 batch | |
+| loss.backward() | 每 batch | |
+| clip_grad_norm_() | 每 batch | |
+| optimizer.step() | 每 batch | |
+| scheduler.step() | 每 batch 或 每 epoch | 取决于调度器类型 |
+| validate() | 每 epoch | 验证集评估 |
+| save_checkpoint() | 每 epoch | |
+
+不同调度器的 step() 时机：
+
+| 调度器 | 调用时机 |
+|--------|---------|
+| OneCycleLR | 每 batch |
+| StepLR / CosineAnnealingLR / ReduceLROnPlateau | 每 epoch |
+
+### 代码
 
 ```python
 for inputs, targets in dataloader:
@@ -702,14 +769,17 @@ for inputs, targets in dataloader:
     loss = loss_fn(outputs, targets)
     loss.backward()
     
-    # 梯度裁剪
+    # 梯度裁剪：每 batch 执行，超过阈值等比例压缩
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     
     optimizer.step()
+
+# epoch 结束时
+scheduler.step()     # 或 scheduler.step(val_loss)
 ```
 
 **面试话术**：
-> "梯度裁剪防止梯度爆炸，尤其是 RNN/Transformer。我在实际项目中一般用 clip_grad_norm_，阈值设为 1.0 或 5.0，效果很好。"
+> "梯度裁剪防止梯度爆炸，尤其是 RNN/Transformer。我在实际项目中一般用 clip_grad_norm_，阈值设为 1.0 或 5.0，它按 L2 范数等比例压缩，保留梯度方向信息。"
 
 ---
 
