@@ -130,36 +130,65 @@ optimizer.zero_grad()  # 下一步前必须清零
 
 ## 4-2 RMSprop / Adagrad
 
+> 这两个算法的核心都是：**每个参数维护自己的 cache，用 cache 来自适应调节学习率**。
+> optimizer 内部为每个参数维护一组独立的 cache 值。
+
 ### Adagrad
 
-**特点**：每个参数独立自适应学习率，梯度大的参数学习率衰减快。
-
-**适用**：稀疏特征（如 NLP、Embedding）。
+**核心**：历史梯度平方的**累加和**，作为学习率的分母。
 
 ```python
-optimizer = torch.optim.Adagrad(model.parameters(), lr=0.01, 
-                                lr_decay=0.01, weight_decay=0)
+cache_i = cache_i + gradient_i²     # 每个参数单独累积
+param_i = param_i - lr × gradient_i / (√cache_i + ε)
 ```
 
-**问题**：学习率会单调下降，后期训练困难。
+**展开形式**：
+```
+cache_i(t) = g₁² + g₂² + g₃² + ... + g_t²
+```
+
+**特点**：
+- 稀疏特征友好（梯度小的参数 lr 保持较大）
+- cache 只增不减，lr 单调下降
+- lr_decay 让 lr 衰减**更快**（叠加在 Adagrad 原有的衰减上），不是更慢
+
+**例子**（lr=0.01, lr_decay=0.01）：
+
+| Step | lr_decay=0 | lr_decay=0.01 |
+|------|-----------|--------------|
+| 1 | 0.0100 | 0.0099 |
+| 100 | 0.0100 | 0.0050 |
+| 1000 | 0.0100 | 0.0009 |
+
+**问题**：两层衰减叠加，训练后期 lr 接近 0，无法继续学习。
 
 ### RMSprop
 
-**改进**：引入滑动平均，平滑学习率变化。
-
-**公式：**
-```
-cache = γ * cache + (1-γ) * gradient²
-param = param - lr * gradient / (√cache + ε)
-```
-
-- γ: 衰减系数，通常 0.99
-- ε: 防止除零，通常 1e-8
+**核心**：把 Adagrad 的累加和改成**指数移动平均（EMA）**，让历史梯度的影响自然消退。
 
 ```python
-optimizer = torch.optim.RMSprop(model.parameters(), lr=0.001, 
-                               alpha=0.99, eps=1e-8)
+cache_i = γ × cache_i + (1-γ) × gradient_i²
+param_i = param_i - lr × gradient_i / (√cache_i + ε)
 ```
+
+**展开形式**：
+```
+cache_i(t) = (1-γ) × [g_t² + γ·g_{t-1}² + γ²·g_{t-2}² + ...]
+```
+
+- γ=0.9 时，10 步前的梯度权重只剩约 **3.5%**
+- 所以 cache ≈ 最近 ~10 步梯度平方的均值，不是全量累加
+
+**vs Adagrad 对比**：
+
+| | Adagrad | RMSprop |
+|---|---|---|
+| cache 累积 | 累加和（只增不减） | EMA（γ 衰减权重） |
+| lr 变化 | 单调下降 | 趋向稳定值 |
+| 需要 lr_decay | 是（额外压制） | 否（EMA 本身是平滑衰减） |
+| 适用场景 | 稀疏特征 | 非稀疏 / 深度网络 |
+
+**为什么 RMSprop 不需要 lr_decay**：EMA 天然有"记忆窗口"效果，久远梯度自动被 γ^n 指数衰减压制，不需要额外因子再压 lr。
 
 ---
 
