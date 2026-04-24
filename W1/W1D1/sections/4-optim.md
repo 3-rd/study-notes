@@ -586,14 +586,55 @@ for epoch in range(50):
 ### 场景
 
 - 预训练模型微调：特征提取层用小学习率，分类头用大学习率
-- 不同层用不同weight_decay
+- 不同层用不同 weight_decay
+
+### 为什么分层
+
+拿预训练模型微调举例：
+
+```
+模型 = 预训练 backbone（100层，学到的特征很有用）
+     + 随机初始化分类头（1层，要从头学）
+
+backbone：lr 太大，已学好的特征会被破坏
+分类头：lr 太小，从头学太慢
+```
+
+所以：
+- backbone（底层特征）：小 lr（1e-4），保护已学知识
+- 分类头（顶层）：大 lr（1e-3），快速学习新任务
 
 ### 实现
 
 ```python
-# 特征提取层（卷积层）：小学习率，无 weight_decay
-base_params = [p for n, p in model.named_parameters() if 'feature' in n]
-# 分类头：大学习率，有 weight_decay
+optimizer = torch.optim.AdamW([
+    {'params': model.backbone.parameters(), 'lr': 1e-4},
+    {'params': model.head.parameters(), 'lr': 1e-3}
+])
+```
+
+### 结合 scheduler
+
+scheduler 衰减是**相对于每个 param_group 的原始 lr**，按比例衰减：
+
+```python
+optimizer = torch.optim.AdamW([
+    {'params': backbone, 'lr': 1e-4},   # 原始 lr = 1e-4
+    {'params': head, 'lr': 1e-3}        # 原始 lr = 1e-3
+])
+
+scheduler = CosineAnnealingLR(optimizer, T_max=50)
+# 50 epoch 后：
+# backbone lr = 1e-4 × 衰减比例
+# head lr = 1e-3 × 衰减比例
+```
+
+scheduler 内部遍历 `optimizer.param_groups`，每个 group 按自己的原始 lr 比例衰减。
+
+### 按参数名筛选
+
+```python
+base_params = [p for n, p in model.named_parameters() if 'head' not in n]
 head_params = [p for n, p in model.named_parameters() if 'head' in n]
 
 optimizer = torch.optim.AdamW([
@@ -602,15 +643,21 @@ optimizer = torch.optim.AdamW([
 ])
 ```
 
-### 另一种写法（通过 dict）
+### 不同层设不同 lr
 
 ```python
 optimizer = torch.optim.AdamW([
-    {'params': model.feature.parameters(), 'lr': 1e-4},
+    {'params': model.layer0.parameters(), 'lr': 1e-5},
+    {'params': model.layer1.parameters(), 'lr': 5e-5},
+    {'params': model.layer2.parameters(), 'lr': 1e-4},
+    {'params': model.layer3.parameters(), 'lr': 5e-4},
     {'params': model.head.parameters(), 'lr': 1e-3}
-], weight_decay=0.01)
-# 注意：weight_decay 对所有参数生效，可设为 0，再用 params 指定
+])
 ```
+
+### 核心本质
+
+分层设置 → 共用 scheduler → 每个 group 按自己的原始 lr 比例衰减。优化器和 scheduler 算法完全一样，只是初始 lr 不同。
 
 ---
 
