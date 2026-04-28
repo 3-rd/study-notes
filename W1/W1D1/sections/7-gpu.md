@@ -29,6 +29,48 @@ x = x.to(device)
 print(next(model.parameters()).device)  # cuda:0
 ```
 
+### 设备迁移涉及什么
+
+模型和数据是最直观的，还有三样容易被忽略：
+
+| 迁移对象 | 说明 |
+|---------|------|
+| **模型参数** | `model.to(device)` |
+| **数据** | `x.to(device)`, `y.to(device)` |
+| **Optimizer state** | 与模型分离，必须在 model.to 之后创建 |
+| **自定义 Loss** | 如果是 `nn.Module` 形式的 loss，需要 `.to(device)` |
+| **Buffers** | `BatchNorm` 的 running_mean/running_var，model.to 时自动迁移 |
+
+### Optimizer 与模型的关系
+
+**Optimizer 和模型是分开的，不在模型里面。** Optimizer 持有模型参数的引用。
+
+```python
+model = MyModel()                              # nn.Module 子类
+optimizer = torch.optim.Adam(model.parameters())  # Optimizer 单独创建，引用 model 的参数
+```
+
+**Optimizer 必须在 model.to 之后创建**：
+
+```python
+# 正确 ✅：model 迁 GPU 后再创建 optimizer
+model = MyModel().to('cuda')
+optimizer = torch.optim.Adam(model.parameters())  # state 自动在 GPU 上
+
+# 有坑 ❌：model 在 CPU 时先创建了 optimizer
+model = MyModel()                               # 参数在 CPU
+optimizer = torch.optim.Adam(model.parameters()) # state 在 CPU（记住了参数在 CPU）
+model = model.to('cuda')                        # 参数去了 GPU，但 optimizer.state 还指向 CPU
+# 训练时报错：Expected all tensors to be on the same device
+```
+
+**如果 optimizer 已经创建好了需要迁移**：重建 optimizer 即可。
+
+```python
+model = model.to('cuda')
+optimizer = torch.optim.Adam(model.parameters())  # 重建 optimizer
+```
+
 ### .cuda() vs .to(device)
 
 ```python
@@ -40,14 +82,49 @@ model.to('cuda')
 model.to(device)
 ```
 
-### 多 GPU 自动选择
+### .to() 不修改原对象
 
 ```python
-# 多卡时选择第一块可用 GPU（避免 hardcode 0）
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# 常见错误 ❌：以为 .to() 会原地修改
+model.to(device)
+output = model(x)  # model 还在 CPU 上，报错
 
-# 或者显式指定
-device = torch.device('cuda:0')
+# 正确 ✅：必须重新赋值
+model = model.to(device)
+output = model(x)  # ✓
+```
+
+### 标量 tensor 默认在 CPU
+
+```python
+a = torch.tensor(3)
+print(a.device)  # cpu
+
+# 正确做法：创建时就指定 device
+a = torch.tensor(3, device=device)
+# 或创建后迁移
+a = torch.tensor([1, 2, 3]).to(device)
+```
+
+### device 常量写法
+
+```python
+# ❌ hardcode：如果没有 GPU 就会报错
+model = model.to('cuda:0')
+
+# ✅ 自动适配：自动检测有无 GPU
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
+```
+
+### 多卡时选特定 GPU
+
+```python
+# 当前进程绑定到 GPU 0（避免 hardcode）
+torch.cuda.set_device(0)
+
+# 或者用环境变量，进程只看到第 2 张卡
+# CUDA_VISIBLE_DEVICES=1 python train.py
 ```
 
 ---
@@ -80,15 +157,53 @@ GPU2: batch[22:32]  → forward → 梯度
 主 GPU 累加梯度 → optimizer.step()
 ```
 
-### DP 的问题（为什么工业不用）
+### batch 设定的含义
+
+**batch=32 指的是喂给模型的 batch 总数，DP 自动在 batch 维度切分到各卡**。
+
+- batch=32，3卡 → 每卡 ~11，总量 32
+- batch=128，4卡 → 每卡 32，总量 128
+
+**batch 总数和单卡一样，所以学习率不需要调整**，训练效果（模型收敛行为）和单卡 batch=32 完全等价。
+
+### GIL — DP 的核心限制
+
+**GIL（Global Interpreter Lock）** 是 CPython（Python 官方解释器）的特性：同一时刻只能有一个线程执行 Python 字节码。
+
+DP 内部使用 Python **多线程**（不是多进程），所以：
+- 虽然有 3 张 GPU，但 Python 这边是串行的
+- GPU 计算时会释放 GIL，PyTorch 底层 CUDA 操作不受 GIL 约束
+- 但 Python 层的调度和协调仍受 GIL 限制
+
+这就是为什么 DP 效率不如 DDP。
+
+### DP 的问题
 
 | 问题 | 说明 |
 |------|------|
-| **单进程，GIL 限制** | Python GIL 限制并行，只能用多线程，受 GIL 约束 |
+| **GIL 限制** | 单进程多线程，Python 层串行，效率受限 |
 | **主 GPU 通信瓶颈** | 所有梯度在主 GPU 汇总，主卡通信成为瓶颈 |
+| **主 GPU 显存压力** | 所有梯度汇总到主卡，GPU 0 显存占用最高 |
 | **无法多机** | 只支持单机多卡，不能跨机器 |
+| **官方已标记 legacy** | PyTorch 推荐用 DDP，DP 只适合科研快速实验 |
 
-> DataParallel 适合科研快速实验，工业训练几乎不用。
+### device_ids 指定用哪些卡
+
+```python
+# 不用全部卡，只用第 0 和第 2 张
+model = nn.DataParallel(model, device_ids=[0, 2])
+```
+
+### DP vs 单卡的效果对比
+
+| | 单卡 batch=32 | DP 3卡 batch=32 |
+|---|---|---|
+| 每步样本量 | 32 | 32（每卡 ~11，总量不变） |
+| 学习率 | 不变 | 不变 |
+| 训练效果 | 等价 | 等价 |
+| 速度 | 基准 | 更快（3卡并行计算） |
+
+> DataParallel 适合科研快速实验，工业训练几乎不用 DDP。
 
 ---
 
@@ -384,3 +499,18 @@ torchrun --nproc_per_node=4 \
 
 ### Q6: 混合精度训练为什么能省显存？
 用 float16 存储激活值和梯度，用 float32 存储参数更新。激活值是显存最大头，减半后显存显著降低。
+
+### Q7: Optimizer 和模型的关系？Optimizer 在模型里面吗？
+Optimizer 和模型是分开的，不在模型里面。Optimizer 持有模型参数的引用。**必须先 model.to(device)，再创建 optimizer**，否则 optimizer.state 记住了参数在 CPU，训练时会报错 "Expected all tensors to be on the same device"。
+
+### Q8: device 迁移涉及哪些对象？
+模型（model.to(device)）、数据（x.to(device), y.to(device)）、Optimizer（必须在 model.to 之后创建）、自定义 Loss（如果是 nn.Module 需要 to(device)）。Buffers（BatchNorm 等）由 model.to 自动迁移。
+
+### Q9: GIL 是什么？为什么存在？
+GIL（Global Interpreter Lock）是 CPython 的特性：同一时刻只有一个线程能执行 Python 字节码。因为 CPython 的内存管理不是线程安全的，加全局锁简化了实现。**Python 多线程对 CPU 密集型任务无效**，但 I/O 等待和 PyTorch CUDA 操作时会释放 GIL，此时其他线程可以执行。
+
+### Q10: DP 中 batch=32 3卡，学习率要调吗？
+不需要。batch=32 是 batch 总数，DP 在 batch 维度自动切分到各卡（每卡 ~11），**每步处理的样本总量仍是 32**，和单卡 batch=32 效果等价，学习率不变。DP 和 DDP 在这上面行为不同：DDP 每卡都加载完整 batch。
+
+### Q11: 为什么 DP 效率不如 DDP？
+DP 用 Python 多线程，受 GIL 限制，Python 层是串行的；DDP 每卡一个独立进程，无 GIL，效率高。另外 DP 主 GPU 汇总所有梯度是通信瓶颈，DDP 用 all-reduce 均摊到每张卡。
